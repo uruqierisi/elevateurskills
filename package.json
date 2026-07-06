@@ -13,18 +13,25 @@
     "start": "node dist/cli.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "smoke:llm": "tsx scripts/smoke-llm.ts",
-    "smoke:loop": "tsx scripts/smoke-loop.ts"
+    "smoke:loop": "tsx scripts/smoke-loop.ts",
+    "smoke:tui": "tsx scripts/smoke-tui.tsx"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
+    "chalk": "^5.6.2",
     "commander": "^12.1.0",
     "dotenv": "^16.4.5",
+    "ink": "^5.2.1",
+    "ink-spinner": "^5.0.0",
+    "react": "^18.3.1",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",
+    "@types/react": "^18.3.31",
+    "ink-testing-library": "^4.0.0",
     "tsx": "^4.19.2",
     "typescript": "^5.6.3"
   }

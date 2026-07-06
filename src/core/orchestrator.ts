@@ -1,16 +1,23 @@
-import { runAgent, type AgentEvent } from "./loop.js";
+import { join } from "node:path";
+import { runAgent } from "./loop.js";
 import { createSandbox, type Sandbox, type SandboxOptions } from "./sandbox.js";
 import { RunState, type StageName } from "./state.js";
 import { AGENTS, PIPELINE, agentSystemPrompt, type AgentDef, type GateResult } from "./agents.js";
 import { scaffoldWorkspace } from "./scaffold.js";
+import { resolveModelId } from "./llm.js";
+import { EventBus, type CheckpointDecision } from "./events.js";
 import type { ToolContext } from "./tools/index.js";
 import { selectTools } from "./tools/index.js";
 
 /**
  * The orchestrator. Owns run state, drives the pipeline stage by stage, gates
  * each stage on its validation, re-spawns a failed agent with its failure
- * output, and (unless --auto) pauses at a checkpoint between stages so a human
- * can inspect artifacts — most importantly the frozen contract.
+ * output, and (unless --auto) pauses at a checkpoint between stages.
+ *
+ * It talks to the outside world ONLY by emitting structured events on the bus
+ * (see events.ts) and by writing full transcripts to runs/<id>/log/. It never
+ * prints to the console or knows anything about a UI. That decoupling is the
+ * whole point: renderers subscribe; logic emits.
  */
 
 export interface OrchestratorOptions {
@@ -19,21 +26,18 @@ export interface OrchestratorOptions {
   runsRoot: string;
   auto: boolean;
   resumeId?: string;
-  /** Stop after this stage (inclusive). Useful for incremental runs. */
   stopAfter?: StageName;
-  /** Run only these stages (still respecting dependencies already satisfied). */
   only?: StageName[];
   maxAttempts: number;
   sandbox?: SandboxOptions;
-  /** Per-agent model overrides, keyed by agent name. */
   models?: Record<string, string>;
+  /** Structured event sink. Renderers subscribe to this. */
+  bus: EventBus;
   /**
-   * Called after each stage passes its gate. Return "abort" to stop the run.
-   * Omitted / auto mode => always continue.
+   * Resolves a paused checkpoint. Provided by whichever renderer is active
+   * (TUI keypress or plain readline). Omitted => behave as "continue".
    */
-  checkpoint?: (info: { stage: string; gate: GateResult; state: RunState }) => Promise<"continue" | "abort">;
-  onEvent?: (stage: string, e: AgentEvent) => void;
-  log?: (msg: string) => void;
+  checkpoint?: (info: { stage: string; gate: GateResult; state: RunState; artifactPaths: string[] }) => Promise<CheckpointDecision>;
 }
 
 export interface OrchestratorResult {
@@ -43,19 +47,24 @@ export interface OrchestratorResult {
   aborted: boolean;
 }
 
+interface Usage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
 export async function orchestrate(opts: OrchestratorOptions): Promise<OrchestratorResult> {
-  const log = opts.log ?? ((m: string) => console.log(m));
+  const { bus } = opts;
   const state = RunState.openOrCreate(opts.runsRoot, {
     request: opts.request,
     stack: opts.stack,
     id: opts.resumeId,
   });
   const sandbox = createSandbox(state.workspaceDir, opts.sandbox);
+  const { provider, model } = resolveModelId();
+  const modelStr = `${provider}/${model}`;
 
-  log(`\n▶ run ${state.manifest.id}`);
-  log(`  request: ${state.manifest.request}`);
-  log(`  stack:   ${state.manifest.stack}`);
-  log(`  sandbox: ${sandbox.kind} (${sandbox.root})`);
+  bus.emit({ type: "run:start", runId: state.manifest.id, request: state.manifest.request, stack: state.manifest.stack, model: modelStr });
 
   const scope = opts.only ?? (PIPELINE as StageName[]);
   const completed: string[] = [];
@@ -65,47 +74,80 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
 
     // Deterministic scaffold happens once, right after the contract is frozen.
     if (stageName === "backend" && !state.isDone("scaffold")) {
-      log(`\n■ scaffold`);
       scaffoldWorkspace(state, sandbox);
       state.setStage("scaffold", "done");
-      log(`  scaffold: workspace folders created from contract`);
     }
 
     if (state.isDone(stageName)) {
-      log(`\n■ ${stageName}: already done (resumed) — skipping`);
+      // Resumed: surface it as an instantly-complete stage so the UI shows it.
+      bus.emit({ type: "stage:start", stage: stageName, agent: stageName });
+      bus.emit({ type: "stage:done", stage: stageName, durationMs: 0, artifacts: artifactPathsFor(state, stageName) });
       completed.push(stageName);
       continue;
     }
 
     const def = AGENTS[stageName];
-    const gate = await runStageWithRetries(def, state, sandbox, opts, log);
-    if (!gate.pass) {
-      log(`\n✖ ${stageName} did not pass its gate after ${opts.maxAttempts} attempt(s).`);
-      log(gate.detail);
-      state.setStage(stageName, "failed", gate.detail.slice(0, 500));
-      return { state, completed, stoppedAt: stageName, aborted: true };
-    }
+    let decision: CheckpointDecision = "continue";
 
-    state.setStage(stageName, "done", gate.detail.slice(0, 500));
-    completed.push(stageName);
-    log(`\n✔ ${stageName} passed: ${gate.detail.split("\n")[0]}`);
+    do {
+      const startedAt = Date.now();
+      bus.emit({ type: "stage:start", stage: stageName, agent: def.name });
 
-    if (opts.stopAfter && stageName === opts.stopAfter) {
-      log(`\n⏹ stopping after ${stageName} (--stop-after)`);
-      return { state, completed, stoppedAt: stageName, aborted: false };
-    }
+      const { gate, usage } = await runStageWithRetries(def, state, sandbox, opts);
 
-    if (!opts.auto && opts.checkpoint) {
-      const decision = await opts.checkpoint({ stage: stageName, gate, state });
-      if (decision === "abort") {
-        log(`\n⏹ aborted at checkpoint after ${stageName}`);
+      bus.emit({ type: "stage:gate", stage: stageName, passed: gate.pass, detail: gate.detail });
+
+      if (!gate.pass) {
+        state.setStage(stageName, "failed", gate.detail.slice(0, 500));
+        bus.emit({ type: "run:error", stage: stageName, error: gate.detail });
         return { state, completed, stoppedAt: stageName, aborted: true };
       }
-    }
+
+      state.setStage(stageName, "done", gate.detail.slice(0, 500));
+      bus.emit({
+        type: "stage:done",
+        stage: stageName,
+        durationMs: Date.now() - startedAt,
+        artifacts: artifactPathsFor(state, stageName),
+        tokens: usage.totalTokens,
+      });
+
+      if (opts.stopAfter && stageName === opts.stopAfter) {
+        completed.push(stageName);
+        return { state, completed, stoppedAt: stageName, aborted: false };
+      }
+
+      decision = "continue";
+      if (!opts.auto && opts.checkpoint) {
+        const artifactPaths = artifactPathsFor(state, stageName);
+        bus.emit({ type: "checkpoint:await", stage: stageName, artifactPaths });
+        decision = await opts.checkpoint({ stage: stageName, gate, state, artifactPaths });
+        if (decision === "quit") {
+          return { state, completed, stoppedAt: stageName, aborted: true };
+        }
+        // "retry" re-runs this stage's agent (e.g. the contract needs redoing).
+      }
+    } while (decision === "retry");
+
+    completed.push(stageName);
   }
 
-  log(`\n✅ pipeline complete. Project at: ${state.workspaceDir}`);
+  bus.emit({
+    type: "run:done",
+    runId: state.manifest.id,
+    workspacePath: state.workspaceDir,
+    summary: `${completed.length} stage(s) completed: ${completed.join(", ")}`,
+  });
   return { state, completed, aborted: false };
+}
+
+/** The inspectable artifacts a stage produced (absolute paths). */
+function artifactPathsFor(state: RunState, stage: string): string[] {
+  const def = AGENTS[stage];
+  if (def?.mode === "contract" && def.artifact && state.hasArtifact(def.artifact)) {
+    return [state.artifactPath(def.artifact)];
+  }
+  return [state.workspaceDir];
 }
 
 /** Runs one stage, re-spawning on gate failure with the failure appended. */
@@ -114,22 +156,23 @@ async function runStageWithRetries(
   state: RunState,
   sandbox: Sandbox,
   opts: OrchestratorOptions,
-  log: (m: string) => void,
-): Promise<GateResult> {
+): Promise<{ gate: GateResult; usage: Usage }> {
+  const { bus } = opts;
   const model = opts.models?.[def.name];
   let lastGate: GateResult = { pass: false, detail: "not run" };
+  const usage: Usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
   let extraContext = "";
 
   for (let attempt = 1; attempt <= opts.maxAttempts; attempt++) {
-    const n = state.incrementAttempt(def.name as StageName);
-    log(`\n■ ${def.name} (attempt ${attempt}/${opts.maxAttempts}, total ${n})${model ? ` [model=${model}]` : ""}`);
+    state.incrementAttempt(def.name as StageName);
+    if (attempt > 1) {
+      bus.emit({ type: "stage:progress", stage: def.name, tool: "retry", summary: `attempt ${attempt}/${opts.maxAttempts}` });
+    }
 
     const ctx: ToolContext = {
       sandbox,
       state: state.stateAccess(),
-      log: (m) => {
-        state.appendLog(def.name, `[tool] ${m}`);
-      },
+      log: (m) => state.appendLog(def.name, `[tool] ${m}`),
     };
 
     const task = def.buildTask(state) + extraContext;
@@ -141,10 +184,19 @@ async function runStageWithRetries(
       model,
       maxIterations: def.maxIterations,
       onEvent: (e) => {
+        // Full, untruncated transcript to disk regardless of renderer.
         state.appendLog(def.name, `[${e.type}]${e.toolName ? ` ${e.toolName}` : ""} ${e.text}`);
-        opts.onEvent?.(def.name, e);
+        // Structured, truncatable event to the bus for live rendering.
+        if (e.type === "assistant" && e.text) {
+          bus.emit({ type: "agent:token", stage: def.name, text: e.text });
+        } else if (e.type === "tool_call" || e.type === "tool_result") {
+          bus.emit({ type: "stage:progress", stage: def.name, tool: e.toolName ?? "tool", summary: e.text });
+        } else if (e.type === "error") {
+          bus.emit({ type: "stage:progress", stage: def.name, tool: e.toolName ?? "error", summary: e.text });
+        }
       },
     });
+    accumulate(usage, result.usage);
     state.appendLog(def.name, `\n=== FINAL (attempt ${attempt}) ===\n${result.finalText}\n`);
 
     // Contract agents emit JSON as their final message; persist it as an artifact.
@@ -152,20 +204,35 @@ async function runStageWithRetries(
       const parsed = extractJson(result.finalText);
       if (parsed === undefined) {
         lastGate = { pass: false, detail: "Agent did not return a parseable JSON object." };
-      } else {
-        state.writeArtifact(def.artifact, parsed);
+        extraContext = failureContext(lastGate.detail);
+        continue;
       }
+      state.writeArtifact(def.artifact, parsed);
     }
 
-    lastGate = await def.gate({ state, sandbox, log: (m) => log(`  ${m}`) });
-    if (lastGate.pass) return lastGate;
+    lastGate = await def.gate({
+      state,
+      sandbox,
+      log: (m) => bus.emit({ type: "stage:progress", stage: def.name, tool: "gate", summary: m }),
+    });
+    if (lastGate.pass) return { gate: lastGate, usage };
 
-    log(`  gate failed: ${lastGate.detail.split("\n")[0]}`);
-    extraContext =
-      `\n\n--- PREVIOUS ATTEMPT FAILED ITS VALIDATION GATE ---\n` +
-      `Fix these problems and try again:\n${lastGate.detail.slice(0, 6000)}\n`;
+    extraContext = failureContext(lastGate.detail);
   }
-  return lastGate;
+  return { gate: lastGate, usage };
+}
+
+function failureContext(detail: string): string {
+  return (
+    `\n\n--- PREVIOUS ATTEMPT FAILED ITS VALIDATION GATE ---\n` +
+    `Fix these problems and try again:\n${detail.slice(0, 6000)}\n`
+  );
+}
+
+function accumulate(target: Usage, add: Usage): void {
+  target.promptTokens += add.promptTokens;
+  target.completionTokens += add.completionTokens;
+  target.totalTokens += add.totalTokens;
 }
 
 /**
@@ -177,7 +244,6 @@ export function extractJson(text: string): unknown {
   const candidate = fenced ? fenced[1] : text;
   const start = candidate.indexOf("{");
   if (start === -1) return undefined;
-  // Walk braces to find the matching close, ignoring braces inside strings.
   let depth = 0;
   let inStr = false;
   let esc = false;

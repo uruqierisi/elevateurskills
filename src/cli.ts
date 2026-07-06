@@ -1,9 +1,12 @@
-import { createInterface } from "node:readline/promises";
 import { resolve } from "node:path";
 import { Command } from "commander";
+import chalk from "chalk";
 import { loadEnv, REPO_ROOT } from "./core/env.js";
 import { orchestrate } from "./core/orchestrator.js";
 import { PIPELINE } from "./core/agents.js";
+import { resolveModelId } from "./core/llm.js";
+import { EventBus } from "./core/events.js";
+import { attachRenderer } from "./ui/index.js";
 import type { StageName } from "./core/state.js";
 
 /**
@@ -13,6 +16,10 @@ import type { StageName } from "./core/state.js";
  *
  * Runs stage-by-stage with a checkpoint between stages so you can inspect the
  * frozen contract before Backend/Frontend build. Pass --auto to skip checkpoints.
+ *
+ * The CLI owns no rendering logic: it creates an EventBus, attaches a renderer
+ * (TUI on a TTY, plain otherwise or with --plain), and hands the bus to the
+ * orchestrator. The pipeline only emits events.
  */
 async function main() {
   loadEnv();
@@ -24,6 +31,7 @@ async function main() {
     .option("-r, --request <text>", "high-level software request")
     .option("-s, --stack <name>", "target stack", "node-prisma-react")
     .option("--auto", "skip inter-stage checkpoints (autonomous)", false)
+    .option("--plain", "force the plain line renderer (no TUI)", false)
     .option("--resume <run-id>", "resume an existing run")
     .option("--stop-after <stage>", "stop after this stage")
     .option("--only <stages>", "comma-separated subset of stages to run")
@@ -62,49 +70,49 @@ async function main() {
   }
 
   const runsRoot = resolve(REPO_ROOT, opts.runsDir);
-  const interactive = !opts.auto && process.stdin.isTTY;
+  const { provider, model } = resolveModelId();
 
-  const result = await orchestrate({
-    request: opts.request ?? "(resumed run)",
-    stack: opts.stack,
-    runsRoot,
-    auto: !!opts.auto,
-    resumeId: opts.resume,
-    stopAfter: opts.stopAfter as StageName | undefined,
-    only: only as StageName[] | undefined,
-    maxAttempts: Number(opts.maxAttempts) || 2,
-    sandbox: { backend: opts.backend },
-    models,
-    onEvent: (stage, e) => {
-      if (e.type === "tool_call") console.log(`   [${stage}] → ${e.toolName} ${truncate(e.text)}`);
-      else if (e.type === "assistant" && e.text) console.log(`   [${stage}] 💬 ${truncate(e.text, 160)}`);
-      else if (e.type === "error") console.log(`   [${stage}] ⚠ ${truncate(e.text, 200)}`);
-    },
-    checkpoint: interactive
-      ? async ({ stage, state }) => {
-          const rl = createInterface({ input: process.stdin, output: process.stdout });
-          console.log(`\n── checkpoint after ${stage} ──`);
-          console.log(`   run dir: ${state.dir}`);
-          const answer = (await rl.question("   press Enter to continue, or 'q' to stop: ")).trim().toLowerCase();
-          rl.close();
-          return answer === "q" ? "abort" : "continue";
-        }
-      : undefined,
-  });
+  const bus = new EventBus();
+  const renderer = attachRenderer(bus, { plain: !!opts.plain, model: `${provider}/${model}` });
 
-  console.log("\n─────────────────────────────");
-  console.log(`run id:     ${result.state.manifest.id}`);
-  console.log(`completed:  ${result.completed.join(" → ") || "(none)"}`);
-  console.log(`workspace:  ${result.state.workspaceDir}`);
-  if (result.aborted) {
-    console.log(`status:     STOPPED${result.stoppedAt ? ` at ${result.stoppedAt}` : ""}`);
-    process.exit(1);
+  try {
+    const result = await orchestrate({
+      request: opts.request ?? "(resumed run)",
+      stack: opts.stack,
+      runsRoot,
+      auto: !!opts.auto,
+      resumeId: opts.resume,
+      stopAfter: opts.stopAfter as StageName | undefined,
+      only: only as StageName[] | undefined,
+      maxAttempts: Number(opts.maxAttempts) || 2,
+      sandbox: { backend: opts.backend },
+      models,
+      bus,
+      checkpoint: opts.auto ? undefined : (info) => renderer.awaitCheckpoint(info.stage, info.artifactPaths),
+    });
+
+    renderer.stop();
+    printFinalSummary(result);
+    // Set exit code and let Node drain — a hard process.exit races the TUI's
+    // stdin/timer handle cleanup and can trip a libuv assertion on Windows.
+    if (result.aborted) process.exitCode = 1;
+  } finally {
+    renderer.stop();
   }
-  console.log(`status:     ${result.stoppedAt ? `stopped after ${result.stoppedAt}` : "complete"}`);
 }
 
-function truncate(s: string, n = 120): string {
-  return s.length > n ? s.slice(0, n) + "…" : s;
+function printFinalSummary(result: import("./core/orchestrator.js").OrchestratorResult): void {
+  const recap = PIPELINE.filter((s) => result.completed.includes(s))
+    .map((s) => `  ${chalk.green("✓")} ${s}`)
+    .join("\n");
+  process.stdout.write("\n" + chalk.dim("─".repeat(40)) + "\n");
+  process.stdout.write(`${chalk.bold("run")}       ${result.state.manifest.id}\n`);
+  if (recap) process.stdout.write(`${chalk.bold("completed")}\n${recap}\n`);
+  process.stdout.write(`${chalk.bold("workspace")} ${result.state.workspaceDir}\n`);
+  const status = result.aborted
+    ? chalk.red(`STOPPED${result.stoppedAt ? ` at ${result.stoppedAt}` : ""}`)
+    : chalk.green(result.stoppedAt ? `stopped after ${result.stoppedAt}` : "complete");
+  process.stdout.write(`${chalk.bold("status")}    ${status}\n`);
 }
 
 function fatal(msg: string): never {
