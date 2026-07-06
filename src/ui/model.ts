@@ -82,6 +82,9 @@ export function applyEvent(m: TuiModel, e: StampedEvent): TuiModel {
         activeStage: e.stage,
         lastTool: undefined,
         tail: [],
+        // A (re)start clears a prior recoverable error for this stage.
+        errorStage: m.errorStage === e.stage ? undefined : m.errorStage,
+        errorText: m.errorStage === e.stage ? undefined : m.errorText,
       };
 
     case "stage:progress":

@@ -54,9 +54,16 @@ Or without building, straight from TypeScript:
 npm run dev -- --request "a todo REST API"
 ```
 
+On an interactive terminal you get a live dashboard (header, the pipeline with
+spinner/tick states and durations, the active agent's latest tool call and a
+tail of its output, and a footer with elapsed time, tokens and a rough cost
+estimate). Piped or CI output falls back to clean timestamped log lines; force
+that anywhere with `--plain`.
+
 The pipeline pauses at a checkpoint between stages so you can inspect the
-Architect's frozen contract before Backend and Frontend build on it. Pass
-`--auto` to run straight through.
+Architect's frozen contract before Backend and Frontend build on it —
+**[c]** continue, **[r]** retry the stage, **[q]** quit (single keypress, no
+Enter). Pass `--auto` to run straight through.
 
 ---
 
@@ -102,6 +109,23 @@ An agent may not report success until its gate passes. On failure the
 orchestrator re-spawns it with the failure output as new context, up to
 `--max-attempts` times.
 
+### UI is decoupled from logic
+
+The orchestrator and agents never print or know about a UI. They emit a small
+set of typed events (`src/core/events.ts`) on an event bus; renderers subscribe
+and draw. Two renderers auto-select on `process.stdout.isTTY`:
+
+- **TUI** (`src/ui/tui.tsx`, built with Ink) — a single in-place frame. Its
+  "what to show" logic is a pure reducer (`src/ui/model.ts`), so it's testable
+  without a terminal.
+- **Plain** (`src/ui/plain.ts`) — timestamped one-line-per-event output. The
+  always-works fallback for non-TTY, CI, `--auto`, and piped runs.
+
+If Ink fails to mount, the plain renderer takes over instead of crashing the
+run. The full, untruncated transcript always goes to `runs/<id>/log/`
+regardless of renderer. To swap or remove the UI, you touch only `src/ui/` —
+never the pipeline.
+
 ### The agent loop
 
 Every specialist runs the same loop (`src/core/loop.ts`): the model is given a
@@ -121,6 +145,7 @@ elevateurskills [options]
   -r, --request <text>     high-level software request
   -s, --stack <name>       target stack (default: node-prisma-react)
   --auto                   skip inter-stage checkpoints (autonomous)
+  --plain                  force plain line output (no TUI), e.g. for CI/logs
   --resume <run-id>        resume an existing run from its last completed stage
   --stop-after <stage>     stop after a given stage (e.g. architect)
   --only <stages>          run only a subset, comma-separated
@@ -212,8 +237,12 @@ Docker, or pass `--backend docker`, for full isolation.
   pipeline), and `src/core/agents.ts` (the registry).
 - Keep provider logic inside `src/core/llm.ts` and nowhere else.
 - New tools go in `src/core/tools/` and are added to `ALL_TOOLS`.
-- Verify changes end to end: `npm run smoke:llm` (one completion) and
-  `npm run smoke:loop` (a two-tool agent writes and runs a file).
+- Verify changes end to end: `npm run smoke:llm` (one completion),
+  `npm run smoke:loop` (a two-tool agent writes and runs a file), and
+  `npm run smoke:tui` (renders the dashboard from synthetic events).
+- UI work lives entirely in `src/ui/`. Add or change rendering there; if you
+  need new data on screen, add a field to an event in `src/core/events.ts` and
+  emit it from the orchestrator — the renderers stay pure consumers.
 
 ## License
 

@@ -91,8 +91,6 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
 
     do {
       const startedAt = Date.now();
-      bus.emit({ type: "stage:start", stage: stageName, agent: def.name });
-
       const { gate, usage } = await runStageWithRetries(def, state, sandbox, opts);
 
       bus.emit({ type: "stage:gate", stage: stageName, passed: gate.pass, detail: gate.detail });
@@ -165,6 +163,9 @@ async function runStageWithRetries(
 
   for (let attempt = 1; attempt <= opts.maxAttempts; attempt++) {
     state.incrementAttempt(def.name as StageName);
+    // A fresh stage:start per attempt resets the stage to running and clears
+    // any prior error, so a retry visibly re-enters the running state.
+    bus.emit({ type: "stage:start", stage: def.name, agent: def.name });
     if (attempt > 1) {
       bus.emit({ type: "stage:progress", stage: def.name, tool: "retry", summary: `attempt ${attempt}/${opts.maxAttempts}` });
     }
@@ -204,6 +205,7 @@ async function runStageWithRetries(
       const parsed = extractJson(result.finalText);
       if (parsed === undefined) {
         lastGate = { pass: false, detail: "Agent did not return a parseable JSON object." };
+        emitRecoverable(bus, def.name, attempt, opts.maxAttempts, lastGate.detail);
         extraContext = failureContext(lastGate.detail);
         continue;
       }
@@ -217,9 +219,21 @@ async function runStageWithRetries(
     });
     if (lastGate.pass) return { gate: lastGate, usage };
 
+    emitRecoverable(bus, def.name, attempt, opts.maxAttempts, lastGate.detail);
     extraContext = failureContext(lastGate.detail);
   }
   return { gate: lastGate, usage };
+}
+
+/**
+ * A gate failure with attempts remaining is recoverable: surface it as a
+ * run:error (the UI shows it red and notes the re-spawn) but don't stop. When
+ * attempts are exhausted, the caller emits the terminal run:error instead.
+ */
+function emitRecoverable(bus: EventBus, stage: string, attempt: number, maxAttempts: number, detail: string): void {
+  if (attempt < maxAttempts) {
+    bus.emit({ type: "run:error", stage, error: detail });
+  }
 }
 
 function failureContext(detail: string): string {
