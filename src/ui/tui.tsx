@@ -1,6 +1,5 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { render, Box, Text, useInput, type Instance } from "ink";
-import Spinner from "ink-spinner";
 import TextInput from "ink-text-input";
 import type { EventBus, CheckpointDecision } from "../core/events.js";
 import type { RunControl } from "../core/loop.js";
@@ -35,6 +34,20 @@ import { estimateCostUsd, formatCostUsd } from "./format.js";
 const SIDEBAR_WIDTH = 28;
 const INPUT_HEIGHT = 3; // bordered single line
 const STATUS_HEIGHT = 1;
+const CONFIRM_HEIGHT = 4; // bordered two-line modal (border 2 + 2 content)
+const TICK_MS = 100; // single render/animation cadence (~10fps)
+
+/** Braille spinner frames, advanced by the single render tick (no extra interval). */
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+function spinnerFrame(tick: number): string {
+  return SPINNER_FRAMES[tick % SPINNER_FRAMES.length];
+}
+
+// Home/End escape sequences (with the leading ESC stripped by Ink), across the
+// common terminal encodings. Ink's Key type exposes no home/end, so we match
+// the raw sequence delivered as `input`.
+const HOME_SEQS = new Set(["[H", "[1~", "[7~", "OH", "[7$"]);
+const END_SEQS = new Set(["[F", "[4~", "[8~", "OF", "[8$"]);
 
 interface Store {
   model: TuiModel;
@@ -61,14 +74,10 @@ function shortPath(p: string): string {
   return idx >= 0 ? p.slice(idx + 1) : p;
 }
 
-function nodeGlyph(status: NodeStatus): React.ReactElement {
+function nodeGlyph(status: NodeStatus, frame: string): React.ReactElement {
   switch (status) {
     case "running":
-      return (
-        <Text color={theme.accent}>
-          <Spinner type="dots" />
-        </Text>
-      );
+      return <Text color={theme.accent}>{frame}</Text>;
     case "done":
       return <Text color="green">✓</Text>;
     case "failed":
@@ -82,7 +91,7 @@ function nodeGlyph(status: NodeStatus): React.ReactElement {
 
 const LOGO = ["█████  █   █  █████", "█      █   █  █    ", "████   █   █  █████", "█      █   █      █", "█████  █████  █████"];
 
-function Splash({ m }: { m: TuiModel }): React.ReactElement {
+function Splash({ m, frame }: { m: TuiModel; frame: string }): React.ReactElement {
   return (
     <Box height={termSize().rows} alignItems="center" justifyContent="center">
       <Box flexDirection="column" alignItems="center" borderStyle="round" borderColor={theme.accent} paddingX={4} paddingY={1}>
@@ -96,9 +105,7 @@ function Splash({ m }: { m: TuiModel }): React.ReactElement {
           <Text dimColor>v{m.version}</Text>
           <Text dimColor>{TAGLINE}</Text>
           <Box marginTop={1}>
-            <Text color={theme.accent}>
-              <Spinner type="dots" /> Starting pipeline…
-            </Text>
+            <Text color={theme.accent}>{frame} Starting pipeline…</Text>
           </Box>
         </Box>
       </Box>
@@ -106,25 +113,64 @@ function Splash({ m }: { m: TuiModel }): React.ReactElement {
   );
 }
 
-function Transcript({ lines, height, width, scrollOffset }: { lines: StyledLine[]; height: number; width: number; scrollOffset: number }): React.ReactElement {
+interface Viewport {
+  visible: StyledLine[];
+  viewport: number;
+  start: number; // index of first visible line in the full buffer
+  total: number; // total buffered lines
+  above: number; // lines hidden above the viewport
+  below: number; // lines hidden below the viewport
+}
+
+/**
+ * Slice the flat line buffer to the window the viewport shows. `scrollOffset` is
+ * measured in lines up from the bottom: 0 pins to the newest line; the maximum
+ * offset shows the very top. Returns the padded visible slice plus the counts of
+ * hidden lines above/below for the scroll indicator.
+ */
+function computeViewport(lines: StyledLine[], height: number, scrollOffset: number): Viewport {
   const viewport = Math.max(1, height);
   const total = lines.length;
   const maxStart = Math.max(0, total - viewport);
-  const start = Math.max(0, maxStart - scrollOffset);
+  const start = Math.max(0, Math.min(maxStart, maxStart - scrollOffset));
   const visible = lines.slice(start, start + viewport);
   while (visible.length < viewport) visible.push({ text: "" });
+  const above = start;
+  const below = Math.max(0, total - (start + viewport));
+  return { visible, viewport, start, total, above, below };
+}
 
-  // Scrollbar thumb position along the viewport.
+function Transcript({ vp, width }: { vp: Viewport; width: number }): React.ReactElement {
+  const { visible, viewport, start, total, above, below } = vp;
+  const maxStart = Math.max(0, total - viewport);
+  // Scrollbar thumb position along the viewport track.
   const thumbRow = maxStart === 0 ? -1 : Math.round((start / maxStart) * (viewport - 1));
 
   return (
-    <Box flexDirection="row" height={viewport}>
-      <Box flexDirection="column" width={width - 1}>
-        {visible.map((ln, i) => (
-          <Text key={i} color={ln.color} dimColor={ln.dim} italic={ln.italic} bold={ln.bold} wrap="truncate-end">
-            {ln.text || " "}
-          </Text>
-        ))}
+    <Box flexDirection="row" height={viewport} width={width}>
+      <Box flexDirection="column" width={Math.max(1, width - 1)}>
+        {visible.map((ln, i) => {
+          // Overlay a compact "more above/below" hint on the first/last row.
+          if (i === 0 && above > 0) {
+            return (
+              <Text key={i} color={theme.accent} wrap="truncate-end">
+                ▲ {above} more (PgUp)
+              </Text>
+            );
+          }
+          if (i === viewport - 1 && below > 0) {
+            return (
+              <Text key={i} color={theme.accent} wrap="truncate-end">
+                ▼ {below} more (PgDn · End to follow)
+              </Text>
+            );
+          }
+          return (
+            <Text key={i} color={ln.color} dimColor={ln.dim} italic={ln.italic} bold={ln.bold} wrap="truncate-end">
+              {ln.text || " "}
+            </Text>
+          );
+        })}
       </Box>
       <Box flexDirection="column" width={1}>
         {Array.from({ length: viewport }).map((_, i) => (
@@ -137,11 +183,11 @@ function Transcript({ lines, height, width, scrollOffset }: { lines: StyledLine[
   );
 }
 
-function AgentTree({ tree, height }: { tree: TreeNode[]; height: number }): React.ReactElement {
+function AgentTree({ tree, height, frame }: { tree: TreeNode[]; height: number; frame: string }): React.ReactElement {
   return (
-    <Box flexDirection="column" height={height} paddingX={1}>
+    <Box flexDirection="column" height={height} paddingX={1} overflow="hidden">
       <Text>
-        {nodeGlyph(orchestratorStatus(tree))} <Text bold>orchestrator</Text>
+        {nodeGlyph(orchestratorStatus(tree), frame)} <Text bold>orchestrator</Text>
       </Text>
       {tree.map((n, i) => {
         const connector = i === tree.length - 1 ? "└" : "├";
@@ -149,7 +195,7 @@ function AgentTree({ tree, height }: { tree: TreeNode[]; height: number }): Reac
         return (
           <Text key={n.name}>
             <Text dimColor> {connector} </Text>
-            {nodeGlyph(n.status)} <Text dimColor={n.status === "pending"} bold={running}>
+            {nodeGlyph(n.status, frame)} <Text dimColor={n.status === "pending"} bold={running}>
               {n.name}
             </Text>
           </Text>
@@ -193,7 +239,7 @@ function StatusBar({ m }: { m: TuiModel }): React.ReactElement {
   }
   return (
     <Box justifyContent="space-between">
-      <Text dimColor>···· esc stop</Text>
+      <Text dimColor>PgUp/PgDn scroll · Home/End top/bottom · esc stop</Text>
       <Text dimColor>ctrl-q quit</Text>
     </Box>
   );
@@ -221,28 +267,70 @@ function InputArea({
 // --- dashboard ------------------------------------------------------------
 
 export function Dashboard({ store }: { store: Store }): React.ReactElement {
-  const [, setTick] = useState(0);
+  const [tick, setTick] = useState(0);
+  // scrollOffset: lines scrolled up from the bottom. 0 = pinned to newest.
   const [scrollOffset, setScrollOffset] = useState(0);
   const [input, setInput] = useState("");
+  // Previous line-buffer length, to hold position when scrolled up and new
+  // lines arrive (increase the offset by the growth so the view stays put).
+  const prevLenRef = useRef(0);
 
+  // Single render/animation loop: advances the spinner and the splash timer.
   useEffect(() => {
     const id = setInterval(() => {
-      // Leave the splash after ~1s or once real content has arrived.
       if (store.model.phase === "splash") {
         const elapsed = Date.now() - store.model.startTs;
         if (elapsed > 1000 || store.model.blocks.length > 0) store.model = enterMain(store.model);
       }
       setTick((t) => (t + 1) % 1_000_000);
-    }, 100);
+    }, TICK_MS);
     return () => clearInterval(id);
   }, [store]);
 
+  // Redraw immediately on terminal resize so the viewport height/slice recompute
+  // without waiting for the next tick (avoids a torn frame at the old size).
+  useEffect(() => {
+    const onResize = () => setTick((t) => (t + 1) % 1_000_000);
+    process.stdout.on("resize", onResize);
+    return () => {
+      process.stdout.off("resize", onResize);
+    };
+  }, []);
+
   const m = store.model;
   const { cols, rows } = termSize();
-  const topHeight = Math.max(6, rows - INPUT_HEIGHT - STATUS_HEIGHT - 1);
+  const frame = spinnerFrame(tick);
+
+  // Height budget: the transcript region is the ONLY flexible area. Everything
+  // else has a fixed row cost, and the confirm modal (when shown) is reserved
+  // out of the transcript height so the column total never exceeds `rows` — an
+  // over-tall column is what makes the terminal scroll and the bottom border
+  // jitter on redraw.
+  const reserved = STATUS_HEIGHT + INPUT_HEIGHT + (store.confirmReq ? CONFIRM_HEIGHT : 0);
+  const topHeight = Math.max(3, rows - reserved);
   const leftWidth = Math.max(20, cols - SIDEBAR_WIDTH - 1);
   const contentWidth = Math.max(10, leftWidth - 2);
   const lines = transcriptLines(m.blocks, contentWidth, theme.accent);
+  const maxOffset = Math.max(0, lines.length - topHeight);
+
+  // Stick-to-bottom: when new lines arrive, hold the viewed content in place if
+  // the user has scrolled up; stay pinned to the bottom when at offset 0.
+  useEffect(() => {
+    const prev = prevLenRef.current;
+    const cur = lines.length;
+    prevLenRef.current = cur;
+    const grew = cur - prev;
+    if (grew > 0) {
+      setScrollOffset((o) => (o === 0 ? 0 : Math.min(Math.max(0, cur - topHeight), o + grew)));
+    }
+  }, [lines.length, topHeight]);
+
+  // Keep the offset valid when the viewport grows (resize) or the buffer shrinks.
+  useEffect(() => {
+    setScrollOffset((o) => Math.min(o, maxOffset));
+  }, [maxOffset]);
+
+  const vp = computeViewport(lines, topHeight, Math.min(scrollOffset, maxOffset));
 
   useInput((inputChar, key) => {
     // Command confirm: single-key y/n, input box disabled.
@@ -279,28 +367,38 @@ export function Dashboard({ store }: { store: Store }): React.ReactElement {
       if (store.control) store.control.stopRequested = true;
       return;
     }
-    if (key.pageUp) setScrollOffset((o) => o + Math.max(1, topHeight - 1));
-    else if (key.pageDown) setScrollOffset((o) => Math.max(0, o - Math.max(1, topHeight - 1)));
+    // Scroll keys — chosen because ink-text-input ignores them, so they work
+    // even while the input box is focused and never eat typed characters. Ink's
+    // Key type has no home/end, but it delivers their raw escape sequence (ESC
+    // stripped) as `input`, so we match those directly.
+    const seq = inputChar.replace(/^\u001B/, "");
+    const isHome = HOME_SEQS.has(seq);
+    const isEnd = END_SEQS.has(seq);
+    const page = Math.max(1, topHeight - 1);
+    if (key.pageUp) setScrollOffset((o) => Math.min(maxOffset, o + page));
+    else if (key.pageDown) setScrollOffset((o) => Math.max(0, o - page));
+    else if (isHome) setScrollOffset(maxOffset); // jump to top
+    else if (isEnd) setScrollOffset(0); // jump to bottom + re-pin to follow
   });
 
-  if (m.phase === "splash") return <Splash m={m} />;
+  if (m.phase === "splash") return <Splash m={m} frame={frame} />;
 
   const inputActive = !m.checkpoint && !store.confirmReq;
   return (
-    <Box flexDirection="column" width={cols} height={rows}>
-      <Box flexDirection="row" height={topHeight}>
-        <Box flexDirection="column" width={leftWidth} paddingX={1}>
-          <Transcript lines={lines} height={topHeight} width={leftWidth} scrollOffset={scrollOffset} />
+    <Box flexDirection="column" width={cols} height={rows} overflow="hidden">
+      <Box flexDirection="row" height={topHeight} overflow="hidden">
+        <Box flexDirection="column" width={leftWidth} height={topHeight} paddingX={1} overflow="hidden">
+          <Transcript vp={vp} width={contentWidth} />
         </Box>
-        <Box flexDirection="column" width={SIDEBAR_WIDTH} height={topHeight}>
-          <Box flexGrow={1}>
-            <AgentTree tree={m.tree} height={topHeight - 6} />
+        <Box flexDirection="column" width={SIDEBAR_WIDTH} height={topHeight} overflow="hidden">
+          <Box flexGrow={1} overflow="hidden">
+            <AgentTree tree={m.tree} height={Math.max(1, topHeight - 6)} frame={frame} />
           </Box>
           <UsageBox m={m} />
         </Box>
       </Box>
       {store.confirmReq ? (
-        <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1}>
+        <Box flexDirection="column" height={CONFIRM_HEIGHT} flexShrink={0} borderStyle="round" borderColor="yellow" paddingX={1}>
           <Text color="yellow" bold>
             {store.confirmReq.question}
           </Text>
@@ -309,22 +407,50 @@ export function Dashboard({ store }: { store: Store }): React.ReactElement {
           </Text>
         </Box>
       ) : null}
-      <StatusBar m={m} />
-      <InputArea
-        value={input}
-        onChange={setInput}
-        active={inputActive}
-        onSubmit={(v) => {
-          const text = v.trim();
-          if (text) {
-            store.steers.push(text);
-            store.model = applyEvent(store.model, { type: "agent:token", stage: m.tree.find((n) => n.status === "running")?.name ?? "orchestrator", text: `» you: ${text}`, ts: Date.now() });
-          }
-          setInput("");
-        }}
-      />
+      <Box height={STATUS_HEIGHT} flexShrink={0}>
+        <StatusBar m={m} />
+      </Box>
+      <Box height={INPUT_HEIGHT} flexShrink={0}>
+        <InputArea
+          value={input}
+          onChange={setInput}
+          active={inputActive}
+          onSubmit={(v) => {
+            const text = v.trim();
+            if (text) {
+              store.steers.push(text);
+              store.model = applyEvent(store.model, { type: "agent:token", stage: m.tree.find((n) => n.status === "running")?.name ?? "orchestrator", text: `» you: ${text}`, ts: Date.now() });
+            }
+            setInput("");
+          }}
+        />
+      </Box>
     </Box>
   );
+}
+
+/**
+ * While Ink owns the alternate screen, ANY direct write to stdout/stderr from a
+ * dependency (a deprecation notice, an SDK warning) corrupts the frame and makes
+ * the layout jump. We can't stop the pipeline's own writes here (there are none
+ * — they go through the event bus), but we can neutralise stray console.* calls:
+ * buffer them while mounted and replay them to stderr after unmount so nothing
+ * is lost. Returns a restore function.
+ */
+function guardConsole(): () => void {
+  const methods = ["log", "info", "warn", "error", "debug"] as const;
+  const original: Record<string, (...args: unknown[]) => void> = {};
+  const buffered: string[] = [];
+  for (const name of methods) {
+    original[name] = (console[name] as (...a: unknown[]) => void).bind(console);
+    (console[name] as unknown) = (...args: unknown[]) => {
+      buffered.push(args.map((a) => (typeof a === "string" ? a : String(a))).join(" "));
+    };
+  }
+  return () => {
+    for (const name of methods) (console[name] as unknown) = original[name];
+    if (buffered.length) process.stderr.write(buffered.join("\n") + "\n");
+  };
 }
 
 export function attachTuiRenderer(bus: EventBus, opts: { model?: string; control?: RunControl } = {}): Renderer {
@@ -344,7 +470,16 @@ export function attachTuiRenderer(bus: EventBus, opts: { model?: string; control
     }
   });
 
-  let instance: Instance | null = render(<Dashboard store={store} />, { exitOnCtrlC: false });
+  const restoreConsole = guardConsole();
+  let instance: Instance | null;
+  try {
+    instance = render(<Dashboard store={store} />, { exitOnCtrlC: false });
+  } catch (err) {
+    // Mount failed — restore console so the plain-renderer fallback can print.
+    restoreConsole();
+    unsubscribe();
+    throw err;
+  }
   store.onQuit = () => {
     if (instance) instance.unmount();
   };
@@ -372,6 +507,7 @@ export function attachTuiRenderer(bus: EventBus, opts: { model?: string; control
         instance.unmount();
         instance = null;
       }
+      restoreConsole();
     },
   };
 }
