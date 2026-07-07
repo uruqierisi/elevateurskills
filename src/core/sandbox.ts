@@ -105,6 +105,85 @@ function clip(s: string): string {
   return s.length > MAX_OUTPUT_CHARS ? s.slice(0, MAX_OUTPUT_CHARS) + "\n…[truncated]" : s;
 }
 
+// Environment variable names that are safe to pass through to sandboxed
+// commands. Everything else is dropped — the process env is NOT inherited.
+const ENV_ALLOWLIST = new Set([
+  // POSIX
+  "PATH",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TZ",
+  "TERM",
+  "SHELL",
+  "TMPDIR",
+  "USER",
+  "LOGNAME",
+  // Windows essentials for node/npm to function
+  "SystemRoot",
+  "windir",
+  "ComSpec",
+  "PATHEXT",
+  "NUMBER_OF_PROCESSORS",
+  "PROCESSOR_ARCHITECTURE",
+  "PROCESSOR_IDENTIFIER",
+  "TEMP",
+  "TMP",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "ProgramData",
+  "ProgramFiles",
+  "ProgramFiles(x86)",
+  "SystemDrive",
+  "USERNAME",
+  "PUBLIC",
+  "HOMEDRIVE",
+]);
+
+// Names that must never reach a sandboxed command, even via opts.env.
+const SECRET_NAME = /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|APIKEY)($|_)/i;
+const EXPLICIT_STRIP = new Set(["LLM_API_KEY", "LLM_API_BASE", "ELEVATE_LLM"]);
+
+function isSecretName(name: string): boolean {
+  return EXPLICIT_STRIP.has(name) || SECRET_NAME.test(name);
+}
+
+/**
+ * Builds a minimal environment for a locally-spawned command. The host process
+ * env is never inherited wholesale: only allowlisted names pass through, HOME
+ * is redirected to a scratch dir (so tools can't write into the real home), and
+ * the LLM provider key / model config can never be seen by project code.
+ * Project-specific vars (e.g. DATABASE_URL) arrive via `extra` and are still
+ * filtered for secret-looking names as defense in depth.
+ */
+export function buildLocalEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+  const scratchHome = resolve(process.env.TMPDIR ?? process.env.TEMP ?? "/tmp", "elevateurskills-home");
+  try {
+    mkdirSync(scratchHome, { recursive: true });
+  } catch {
+    /* best effort */
+  }
+
+  const env: NodeJS.ProcessEnv = {};
+  for (const name of ENV_ALLOWLIST) {
+    const val = process.env[name];
+    if (val !== undefined && !isSecretName(name)) env[name] = val;
+  }
+
+  // Redirect HOME to the scratch dir; keep npm's cache there so it persists
+  // across runs without touching the real home directory.
+  env.HOME = scratchHome;
+  env.USERPROFILE = scratchHome;
+  env.HOMEPATH = scratchHome;
+  env.npm_config_cache = resolve(scratchHome, ".npm");
+
+  for (const [name, val] of Object.entries(extra)) {
+    if (isSecretName(name)) continue;
+    env[name] = val;
+  }
+  return env;
+}
+
 export class LocalSandbox implements Sandbox {
   readonly kind = "local" as const;
   readonly root: string;
@@ -125,7 +204,8 @@ export class LocalSandbox implements Sandbox {
       const child = spawn(command, {
         cwd,
         shell: true,
-        env: { ...process.env, ...opts.env },
+        // Minimal, secret-free env — the host env is never inherited.
+        env: buildLocalEnv(opts.env),
       });
       let stdout = "";
       let stderr = "";
