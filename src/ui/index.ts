@@ -4,11 +4,15 @@ import { attachTuiRenderer } from "./tui.js";
 
 export type { Renderer } from "./plain.js";
 
+import type { RunControl } from "../core/loop.js";
+
 export interface RendererOptions {
   /** Force the plain renderer even on a TTY. */
   plain?: boolean;
   /** Resolved `provider/model` for the cost estimate. */
   model?: string;
+  /** Shared stop flag the TUI toggles on ctrl-q / esc. */
+  control?: RunControl;
 }
 
 /**
@@ -20,7 +24,7 @@ export function attachRenderer(bus: EventBus, opts: RendererOptions = {}): Rende
   const useTui = !opts.plain && Boolean(process.stdout.isTTY);
   if (useTui) {
     try {
-      return attachTuiRenderer(bus, { model: opts.model });
+      return attachTuiRenderer(bus, { model: opts.model, control: opts.control });
     } catch {
       // Ink failed to mount — degrade to the always-works plain renderer.
     }

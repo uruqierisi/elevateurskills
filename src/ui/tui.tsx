@@ -3,6 +3,7 @@ import { render, Box, Text, useInput, type Instance } from "ink";
 import Spinner from "ink-spinner";
 import TextInput from "ink-text-input";
 import type { EventBus, CheckpointDecision } from "../core/events.js";
+import type { RunControl } from "../core/loop.js";
 import { packageVersion } from "../core/env.js";
 import {
   initModel,
@@ -39,6 +40,7 @@ interface Store {
   model: TuiModel;
   checkpointResolver: ((d: CheckpointDecision) => void) | null;
   steers: string[];
+  control: RunControl | null;
   onQuit: (() => void) | null;
 }
 
@@ -257,12 +259,18 @@ export function Dashboard({ store }: { store: Store }): React.ReactElement {
       return;
     }
     if (key.ctrl && inputChar === "q") {
+      // Quit now: request stop and drop the live frame immediately.
+      if (store.control) store.control.stopRequested = true;
       store.onQuit?.();
+      return;
+    }
+    if (key.escape) {
+      // Stop the current agent / run gracefully; the pipeline unwinds.
+      if (store.control) store.control.stopRequested = true;
       return;
     }
     if (key.pageUp) setScrollOffset((o) => o + Math.max(1, topHeight - 1));
     else if (key.pageDown) setScrollOffset((o) => Math.max(0, o - Math.max(1, topHeight - 1)));
-    else if (key.escape) setScrollOffset(0);
   });
 
   if (m.phase === "splash") return <Splash m={m} />;
@@ -299,11 +307,12 @@ export function Dashboard({ store }: { store: Store }): React.ReactElement {
   );
 }
 
-export function attachTuiRenderer(bus: EventBus, _opts: { model?: string } = {}): Renderer {
+export function attachTuiRenderer(bus: EventBus, opts: { model?: string; control?: RunControl } = {}): Renderer {
   const store: Store = {
     model: initModel(packageVersion(), Date.now()),
     checkpointResolver: null,
     steers: [],
+    control: opts.control ?? null,
     onQuit: null,
   };
 

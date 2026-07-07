@@ -6,6 +6,7 @@ import { AGENTS, PIPELINE, agentSystemPrompt, type AgentDef, type GateResult } f
 import { scaffoldWorkspace } from "./scaffold.js";
 import { resolveModelId } from "./llm.js";
 import { EventBus, type CheckpointDecision } from "./events.js";
+import type { RunControl } from "./loop.js";
 import type { ToolContext } from "./tools/index.js";
 import { selectTools } from "./tools/index.js";
 
@@ -33,6 +34,10 @@ export interface OrchestratorOptions {
   models?: Record<string, string>;
   /** Structured event sink. Renderers subscribe to this. */
   bus: EventBus;
+  /** Pull operator steer lines submitted via the UI input box. */
+  drainSteers?: () => string[];
+  /** Cooperative stop flag toggled by the UI (ctrl-q / esc). */
+  control?: RunControl;
   /**
    * Resolves a paused checkpoint. Provided by whichever renderer is active
    * (TUI keypress or plain readline). Omitted => behave as "continue".
@@ -92,6 +97,13 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
     do {
       const startedAt = Date.now();
       const { gate, usage } = await runStageWithRetries(def, state, sandbox, opts);
+
+      // Operator asked to stop (ctrl-q / esc): unwind cleanly as aborted.
+      if (opts.control?.stopRequested) {
+        state.setStage(stageName, "failed", "stopped by operator");
+        bus.emit({ type: "run:error", stage: stageName, error: "stopped by operator" });
+        return { state, completed, stoppedAt: stageName, aborted: true };
+      }
 
       bus.emit({ type: "stage:gate", stage: stageName, passed: gate.pass, detail: gate.detail });
 
@@ -226,6 +238,8 @@ async function runStageWithRetries(
       ctx,
       model,
       maxIterations: def.maxIterations,
+      drainSteers: opts.drainSteers,
+      control: opts.control,
       onEvent: (e) => {
         // Full, untruncated transcript to disk regardless of renderer.
         state.appendLog(def.name, `[${e.type}]${e.toolName ? ` ${e.toolName}` : ""} ${e.text}`);
@@ -247,6 +261,11 @@ async function runStageWithRetries(
     });
     accumulate(usage, result.usage);
     state.appendLog(def.name, `\n=== FINAL (attempt ${attempt}) ===\n${result.finalText}\n`);
+
+    // Operator stop: don't run the gate or retry — hand control back to unwind.
+    if (opts.control?.stopRequested) {
+      return { gate: { pass: false, detail: "stopped by operator" }, usage };
+    }
 
     // Contract agents emit JSON as their final message; persist it as an artifact.
     if (def.mode === "contract" && def.artifact) {

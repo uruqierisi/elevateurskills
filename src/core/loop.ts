@@ -18,6 +18,11 @@ export interface AgentEvent {
   model?: string;
 }
 
+/** Cooperative cancellation flag set by the UI (ctrl-q / esc). */
+export interface RunControl {
+  stopRequested: boolean;
+}
+
 export interface RunAgentOptions {
   system: string;
   task: string;
@@ -28,6 +33,10 @@ export interface RunAgentOptions {
   maxIterations?: number;
   temperature?: number;
   onEvent?: (e: AgentEvent) => void;
+  /** Pull operator steer/instruction lines to inject before the next call. */
+  drainSteers?: () => string[];
+  /** Cooperative stop: when set, the agent finishes the current step and exits. */
+  control?: RunControl;
 }
 
 export interface AgentRunResult {
@@ -53,7 +62,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<AgentRunResult> {
 
   let iterations = 0;
   while (iterations < maxIterations) {
+    if (opts.control?.stopRequested) {
+      emit({ type: "assistant", text: "(stopped by operator)" });
+      break;
+    }
     iterations++;
+
+    // Inject any operator steering as a user message before the next call.
+    const steers = opts.drainSteers?.() ?? [];
+    if (steers.length > 0) {
+      messages.push({ role: "user", content: `Operator steering — follow this now:\n${steers.join("\n")}` });
+    }
 
     const res = await chatCompletion({
       messages,

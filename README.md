@@ -70,11 +70,13 @@ npm run dev -- --request "a todo REST API"
 The command resolves its `.env`, `agents/`, and `runs/` relative to the
 package, so you can invoke it from any directory.
 
-On an interactive terminal you get a live dashboard (header, the pipeline with
-spinner/tick states and durations, the active agent's latest tool call and a
-tail of its output, and a footer with elapsed time, tokens and a rough cost
-estimate). Piped or CI output falls back to clean timestamped log lines; force
-that anywhere with `--plain`.
+On an interactive terminal you get a live dashboard: a splash, then a scrollable
+transcript of the active agent (🧠 thinking, 📋 plan, ⚙ tool calls, gate
+results, `── handoff ──` dividers) on the left, an agent tree and a
+model/usage box (tokens + rough cost) on the right, and a steer input box at
+the bottom. Type an instruction and press Enter to steer the running agent;
+**PgUp/PgDn** scroll; **esc** stops, **ctrl-q** quits. Piped or CI output falls
+back to clean timestamped log lines — force that anywhere with `--plain`.
 
 The pipeline pauses at a checkpoint between stages so you can inspect the
 Architect's frozen contract before Backend and Frontend build on it —
@@ -131,9 +133,12 @@ The orchestrator and agents never print or know about a UI. They emit a small
 set of typed events (`src/core/events.ts`) on an event bus; renderers subscribe
 and draw. Two renderers auto-select on `process.stdout.isTTY`:
 
-- **TUI** (`src/ui/tui.tsx`, built with Ink) — a single in-place frame. Its
-  "what to show" logic is a pure reducer (`src/ui/model.ts`), so it's testable
-  without a terminal.
+- **TUI** (`src/ui/tui.tsx`, built with Ink) — a two-column dashboard
+  (transcript · agent tree + usage) with a splash and a steer input. Its
+  "what to show" logic, including transcript-to-line flattening for the manual
+  scroll viewport, is a pure reducer (`src/ui/model.ts`), so it's testable
+  without a terminal. Steering and stop/quit flow back through a small control
+  object (not the bus, which is logic → UI only).
 - **Plain** (`src/ui/plain.ts`) — timestamped one-line-per-event output. The
   always-works fallback for non-TTY, CI, `--auto`, and piped runs.
 

@@ -74,7 +74,8 @@ async function main() {
   const { provider, model } = resolveModelId();
 
   const bus = new EventBus();
-  const renderer = attachRenderer(bus, { plain: !!opts.plain, model: `${provider}/${model}` });
+  const control = { stopRequested: false };
+  const renderer = attachRenderer(bus, { plain: !!opts.plain, model: `${provider}/${model}`, control });
 
   try {
     const result = await orchestrate({
@@ -89,6 +90,8 @@ async function main() {
       sandbox: { backend: opts.backend },
       models,
       bus,
+      control,
+      drainSteers: () => renderer.drainSteers?.() ?? [],
       checkpoint: opts.auto ? undefined : (info) => renderer.awaitCheckpoint(info.stage, info.artifactPaths),
     });
 
