@@ -99,12 +99,18 @@ export function applyEvent(m: TuiModel, e: StampedEvent): TuiModel {
         model: e.model,
       };
 
-    case "run:plan":
-      // Mark every skipped agent up front so the tree shows the plan at a glance.
-      return {
-        ...m,
-        tree: e.skipped.reduce((tree, name) => setNode(tree, name, "skipped"), m.tree),
-      };
+    case "run:plan": {
+      // Mark every skipped agent so the tree shows the plan at a glance, and add
+      // a visible summary block so the Architect checkpoint can show it.
+      const marked = { ...m, tree: e.skipped.reduce((tree, name) => setNode(tree, name, "skipped"), m.tree) };
+      const skips = e.skipped.length ? e.skipped.join(", ") : "none";
+      const text =
+        `◆ profile: ${e.profile}\n` +
+        `  runs:  ${e.requiredAgents.join(", ")}\n` +
+        `  skips: ${skips}\n` +
+        `  sandbox/Docker: ${e.needsSandbox ? "yes" : "no"}`;
+      return push(marked, { kind: "text", stage: "architect", text });
+    }
 
     case "stage:start": {
       const started = {

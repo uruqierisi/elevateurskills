@@ -152,7 +152,19 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
   // static site build with no Docker even when the daemon is absent.
   let sandbox: Sandbox = new LocalSandbox(state.workspaceDir);
   let sandboxActivated = false;
+  let plan: ProjectPlan | null = null;
   const { provider, model } = resolveModelId();
+
+  // Resolve + announce the adaptive plan the moment the frozen contract exists.
+  // Called both before the Architect's checkpoint (so it can show the plan) and
+  // at the top of each later iteration (so skip decisions have it). Idempotent.
+  const ensurePlan = (current: ProjectPlan | null): ProjectPlan | null => {
+    if (current !== null || !state.hasArtifact("architecture.json")) return current;
+    const resolved = resolvePlan(readArchSafe(state), opts.planOverrides ?? {});
+    const skipped = builderStages().filter((s) => !resolved.requiredAgents.includes(s));
+    bus.emit({ type: "run:plan", profile: resolved.profile, requiredAgents: resolved.requiredAgents, skipped, needsSandbox: resolved.needsSandbox });
+    return resolved;
+  };
   const modelStr = `${provider}/${model}`;
 
   bus.emit({ type: "run:start", runId: state.manifest.id, request: state.manifest.request, stack: state.manifest.stack, model: modelStr });
@@ -160,22 +172,14 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
   const scope = opts.only ?? (PIPELINE as StageName[]);
   const completed: string[] = [];
   const skippedStages: string[] = [];
-  // The adaptive plan is resolved once the Architect's contract exists; until
-  // then (planner/architect) every stage is a candidate.
-  let plan: ProjectPlan | null = null;
 
   for (const stageName of PIPELINE as StageName[]) {
     if (!scope.includes(stageName)) continue;
 
     const def = AGENTS[stageName];
 
-    // Resolve the adaptive plan the moment the frozen contract is available, and
-    // announce it (which agents run, which are skipped, whether Docker is used).
-    if (plan === null && state.hasArtifact("architecture.json")) {
-      plan = resolvePlan(readArchSafe(state), opts.planOverrides ?? {});
-      const skipped = builderStages().filter((s) => !plan!.requiredAgents.includes(s));
-      bus.emit({ type: "run:plan", profile: plan.profile, requiredAgents: plan.requiredAgents, skipped, needsSandbox: plan.needsSandbox });
-    }
+    // Resolve the adaptive plan the moment the frozen contract is available.
+    plan = ensurePlan(plan);
 
     // Skip a builder agent the profile does not need: never spawned, no gate.
     if (plan && def.mode === "builder" && !plan.requiredAgents.includes(stageName)) {
@@ -255,6 +259,9 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
         tokens: usage.totalTokens,
       });
       emitTodo(bus, state, [...completed, stageName]);
+      // Classify + announce the plan now (e.g. right after the Architect) so the
+      // checkpoint below can show which agents run/skip and whether Docker is used.
+      plan = ensurePlan(plan);
 
       if (opts.stopAfter && stageName === opts.stopAfter) {
         completed.push(stageName);
