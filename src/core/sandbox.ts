@@ -234,31 +234,61 @@ export class LocalSandbox implements Sandbox {
   }
 }
 
+export interface DockerLimits {
+  memory: string; // e.g. "2g"
+  cpus: string; // e.g. "2"
+  pids: string; // e.g. "512"
+}
+
+const DEFAULT_DOCKER_LIMITS: DockerLimits = { memory: "2g", cpus: "2", pids: "512" };
+
 export class DockerSandbox implements Sandbox {
   readonly kind = "docker" as const;
   readonly root: string;
   private readonly image: string;
+  private readonly limits: DockerLimits;
 
-  constructor(root: string, image: string) {
+  constructor(root: string, image: string, limits: DockerLimits = DEFAULT_DOCKER_LIMITS) {
     this.root = resolve(root);
     mkdirSync(this.root, { recursive: true });
     this.image = image;
+    this.limits = limits;
   }
 
   resolve(relPath: string): string {
     return confinePath(this.root, relPath);
   }
 
-  exec(command: string, opts: ExecOptions = {}): Promise<ExecResult> {
-    const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  /**
+   * Builds the `docker run` argv. Hardened by default: the workspace is the
+   * only mount, all Linux capabilities are dropped, privilege escalation is
+   * blocked, memory/CPU/pids are capped, and the host env is never passed —
+   * only project vars (with secret-looking names filtered) are injected, so the
+   * LLM provider key can never reach project code. Networking uses the default
+   * bridge (outbound for npm/prisma) — never the host network namespace.
+   */
+  buildRunArgs(command: string, opts: ExecOptions, containerName: string): string[] {
     const workdir = opts.cwd ? `/workspace/${opts.cwd.replace(/^\/+/, "")}` : "/workspace";
     const envArgs: string[] = [];
     for (const [k, v] of Object.entries(opts.env ?? {})) {
+      if (isSecretName(k)) continue;
       envArgs.push("-e", `${k}=${v}`);
     }
-    const args = [
+    return [
       "run",
       "--rm",
+      "--name",
+      containerName,
+      "--cap-drop",
+      "ALL",
+      "--security-opt",
+      "no-new-privileges",
+      "--memory",
+      this.limits.memory,
+      "--cpus",
+      this.limits.cpus,
+      "--pids-limit",
+      this.limits.pids,
       "-v",
       `${this.root}:/workspace`,
       "-w",
@@ -269,6 +299,12 @@ export class DockerSandbox implements Sandbox {
       "-lc",
       command,
     ];
+  }
+
+  exec(command: string, opts: ExecOptions = {}): Promise<ExecResult> {
+    const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const containerName = `eus-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const args = this.buildRunArgs(command, opts, containerName);
 
     return new Promise((resolvePromise) => {
       const child = spawn("docker", args, { shell: false });
@@ -277,6 +313,12 @@ export class DockerSandbox implements Sandbox {
       let timedOut = false;
       const timer = setTimeout(() => {
         timedOut = true;
+        // Kill the container itself, not just the docker client process.
+        try {
+          spawnSync("docker", ["kill", containerName], { timeout: 10_000 });
+        } catch {
+          /* ignore */
+        }
         child.kill("SIGKILL");
       }, timeoutMs);
 

@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync, rmSync, symlinkSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { LocalSandbox } from "../src/core/sandbox.js";
+import { LocalSandbox, DockerSandbox } from "../src/core/sandbox.js";
 import { screenCommand } from "../src/core/command-screen.js";
 
 /**
@@ -92,6 +92,28 @@ function main() {
   ok = expectVerdict("cmd /c whoami", "unknown") && ok;
   ok = expectVerdict("./some-random-binary --do-stuff", "unknown") && ok;
   ok = expectVerdict("bash -c 'echo hi'", "unknown") && ok;
+
+  // --- docker run args hardening (no docker daemon needed) ---
+  console.log("\n-- docker run args --");
+  const dsb = new DockerSandbox(join(tmpdir(), `eus-docker-${Date.now()}`), "elevateurskills-sandbox");
+  const dargs = dsb.buildRunArgs("npm install", { cwd: "backend", env: { DATABASE_URL: "postgresql://x", LLM_API_KEY: "sk-LEAK" } }, "eus-test");
+  const joined = dargs.join(" ");
+  const dchecks: Array<[string, boolean]> = [
+    ["drops all capabilities", joined.includes("--cap-drop ALL")],
+    ["no-new-privileges", joined.includes("no-new-privileges")],
+    ["memory limit", joined.includes("--memory 2g")],
+    ["cpu limit", joined.includes("--cpus 2")],
+    ["pids limit", joined.includes("--pids-limit 512")],
+    ["mounts only the workspace", dargs.filter((a) => a === "-v").length === 1],
+    ["never uses host network", !joined.includes("--network host")],
+    ["injects project DATABASE_URL", joined.includes("DATABASE_URL=postgresql://x")],
+    ["never injects LLM_API_KEY", !joined.includes("LLM_API_KEY")],
+    ["workdir is the mount", joined.includes("-w /workspace/backend")],
+  ];
+  for (const [label, pass] of dchecks) {
+    console.log(`${pass ? "PASS" : "FAIL"}  ${label}`);
+    if (!pass) ok = false;
+  }
 
   console.log(ok ? "\n[smoke-sandbox] OK" : "\n[smoke-sandbox] FAILED");
   process.exitCode = ok ? 0 : 1;
