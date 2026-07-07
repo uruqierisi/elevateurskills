@@ -8,7 +8,8 @@ import chalk from "chalk";
 import { loadEnv, REPO_ROOT } from "./core/env.js";
 import { orchestrate } from "./core/orchestrator.js";
 import { PIPELINE } from "./core/agents.js";
-import { resolveModelId } from "./core/llm.js";
+import { resolveModelId, checkKeysForModels } from "./core/llm.js";
+import { AGENT_MODEL_DEFAULTS } from "./core/models.js";
 import { EventBus } from "./core/events.js";
 import { resolveBackend, LOCAL_MODE_WARNING } from "./core/sandbox.js";
 import { attachRenderer } from "./ui/index.js";
@@ -77,6 +78,13 @@ async function main() {
 
   const runsRoot = resolve(REPO_ROOT, opts.runsDir);
   const { provider, model } = resolveModelId();
+
+  // Preflight: every provider that could run (active model + per-agent overrides
+  // + built-in per-agent defaults) must have its key set. Fail fast, naming the
+  // exact env var, before any UI mounts or run directory is created.
+  const modelsInUse = [`${provider}/${model}`, ...Object.values(models), ...Object.values(AGENT_MODEL_DEFAULTS)];
+  const keyError = checkKeysForModels(modelsInUse);
+  if (keyError) fatal(keyError);
 
   // Resolve the sandbox backend up front and announce it before any UI mounts.
   let backend: "docker" | "local";

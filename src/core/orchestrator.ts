@@ -5,6 +5,7 @@ import { RunState, type StageName } from "./state.js";
 import { AGENTS, PIPELINE, agentSystemPrompt, type AgentDef, type GateResult } from "./agents.js";
 import { scaffoldWorkspace } from "./scaffold.js";
 import { resolveModelId } from "./llm.js";
+import { AGENT_MODEL_DEFAULTS } from "./models.js";
 import { EventBus, type CheckpointDecision } from "./events.js";
 import type { RunControl } from "./loop.js";
 import type { ToolContext } from "./tools/index.js";
@@ -212,7 +213,12 @@ async function runStageWithRetries(
   opts: OrchestratorOptions,
 ): Promise<{ gate: GateResult; usage: Usage }> {
   const { bus } = opts;
-  const model = opts.models?.[def.name];
+  // Per-agent model override: an explicit --model wins; otherwise a built-in
+  // per-agent default (which may point at a different provider) applies; else
+  // undefined => the loop falls back to the active ELEVATE_LLM. Each model's
+  // key is resolved from its own provider inside llm.ts, so an agent can run
+  // on a different provider than the rest of the pipeline.
+  const model = opts.models?.[def.name] ?? AGENT_MODEL_DEFAULTS[def.name];
   let lastGate: GateResult = { pass: false, detail: "not run" };
   const usage: Usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
   let extraContext = "";

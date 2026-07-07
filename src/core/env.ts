@@ -45,24 +45,5 @@ export function packageVersion(): string {
   }
 }
 
-/** Loads env then asserts a usable API key is present. */
-export function requireApiKey(): string {
-  loadEnv();
-  const key = (process.env.LLM_API_KEY ?? "").trim();
-  if (!key) {
-    console.error(
-      [
-        "",
-        "[env] LLM_API_KEY is empty.",
-        `      Open ${ENV_PATH} and paste your DeepSeek API key on the line:`,
-        "",
-        "        LLM_API_KEY=sk-...",
-        "",
-        "      Then run the command again.",
-        "",
-      ].join("\n"),
-    );
-    process.exit(1);
-  }
-  return key;
-}
+// Per-provider API keys are resolved in llm.ts (requireKey) based on the
+// selected provider — there is no single global key any more.
