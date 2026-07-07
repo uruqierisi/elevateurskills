@@ -4,6 +4,7 @@ import {
   createSandbox,
   resolveBackend,
   ensureSandboxImage,
+  DockerPostgres,
   LocalSandbox,
   SandboxInfraError,
   type Sandbox,
@@ -15,8 +16,8 @@ import { scaffoldWorkspace } from "./scaffold.js";
 import { resolveModelId } from "./llm.js";
 import { AGENT_MODEL_DEFAULTS } from "./models.js";
 import { resolvePlan, type ProjectPlan, type PlanOverrides } from "./profile.js";
-import { EventBus, type CheckpointDecision } from "./events.js";
-import type { RunControl } from "./loop.js";
+import { EventBus, type CheckpointDecision, type BudgetReason } from "./events.js";
+import { DEFAULT_MAX_AGENT_TOKENS, DEFAULT_MAX_AGENT_TOOL_CALLS, type RunControl } from "./loop.js";
 import type { ToolContext } from "./tools/index.js";
 import { selectTools } from "./tools/index.js";
 
@@ -40,6 +41,10 @@ export interface OrchestratorOptions {
   stopAfter?: StageName;
   only?: StageName[];
   maxAttempts: number;
+  /** Per-agent token budget (circuit breaker). Falls back to the loop default. */
+  maxAgentTokens?: number;
+  /** Per-agent tool-call budget (circuit breaker). Falls back to the loop default. */
+  maxAgentToolCalls?: number;
   sandbox?: SandboxOptions;
   /** Operator consented to run model commands on the host (local sandbox exec). */
   localConsent?: boolean;
@@ -58,7 +63,28 @@ export interface OrchestratorOptions {
    * Resolves a paused checkpoint. Provided by whichever renderer is active
    * (TUI keypress or plain readline). Omitted => behave as "continue".
    */
-  checkpoint?: (info: { stage: string; gate: GateResult; state: RunState; artifactPaths: string[] }) => Promise<CheckpointDecision>;
+  checkpoint?: (info: {
+    stage: string;
+    gate: GateResult;
+    state: RunState;
+    artifactPaths: string[];
+    /** Present when the pause is a circuit-breaker halt, not a normal checkpoint. */
+    budget?: BudgetInfo;
+  }) => Promise<CheckpointDecision>;
+}
+
+/** Per-stage circuit-breaker consumption, for checkpoints and the final summary. */
+export interface BudgetInfo {
+  reason: BudgetReason;
+  tokens: number;
+  maxTokens: number;
+  toolCalls: number;
+  maxToolCalls: number;
+}
+
+export interface StageUsage {
+  tokens: number;
+  toolCalls: number;
 }
 
 export interface OrchestratorResult {
@@ -72,6 +98,8 @@ export interface OrchestratorResult {
   aborted: boolean;
   /** Set when the run halted on a sandbox/environment failure, not a gate. */
   infra?: { message: string; hint: string };
+  /** Token + tool-call usage per stage, for the final summary. */
+  usageByStage: Record<string, StageUsage>;
 }
 
 /** The builder-mode stages, in pipeline order (the ones a profile can skip). */
@@ -90,14 +118,34 @@ function activateSandbox(
   state: RunState,
   opts: OrchestratorOptions,
   stageName: string,
-): { sandbox: Sandbox } | { infra: { message: string; hint: string } } {
+  needsDatabase: boolean,
+): { sandbox: Sandbox; postgres: DockerPostgres | null } | { infra: { message: string; hint: string } } {
   const progress = (summary: string) => bus.emit({ type: "stage:progress", stage: stageName, tool: "sandbox", summary });
   try {
     const backend = resolveBackend({ backend: opts.sandbox?.backend });
     if (backend === "docker") {
       const { tag, built } = ensureSandboxImage(progress);
       progress(`docker ok · image ${tag} ${built ? "built" : "ready"}`);
-      return { sandbox: createSandbox(state.workspaceDir, { backend: "docker", image: tag }) };
+      // A contract with a database gets a throwaway Postgres sidecar so Prisma
+      // can migrate against a live DB; the sandbox reaches it by container name
+      // on a per-run network. Best-effort — a failed sidecar falls back to the
+      // placeholder DATABASE_URL createSandbox injects.
+      let postgres: DockerPostgres | null = null;
+      const net: { network?: string; defaultEnv?: Record<string, string> } = {};
+      if (needsDatabase) {
+        postgres = new DockerPostgres(state.manifest.id);
+        const handle = postgres.start((l) => {
+          state.appendLog("orchestrator", l);
+          progress(l);
+        });
+        if (handle) {
+          net.network = handle.network;
+          net.defaultEnv = { DATABASE_URL: handle.databaseUrl };
+        } else {
+          postgres = null; // start() already cleaned up; use the placeholder URL.
+        }
+      }
+      return { sandbox: createSandbox(state.workspaceDir, { backend: "docker", image: tag, ...net }), postgres };
     }
     // Local execution runs model-generated commands on the host — require consent.
     if (!opts.localConsent) {
@@ -108,7 +156,7 @@ function activateSandbox(
       bus.emit({ type: "env:error", stage: stageName, ...infra });
       return { infra };
     }
-    return { sandbox: createSandbox(state.workspaceDir, { backend: "local" }) };
+    return { sandbox: createSandbox(state.workspaceDir, { backend: "local" }), postgres: null };
   } catch (err) {
     // resolveBackend throws when --backend docker is forced but the daemon is
     // down; ensureSandboxImage throws SandboxInfraError on a build failure.
@@ -144,19 +192,23 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
     stack: opts.stack,
     id: opts.resumeId,
   });
+
   // The sandbox is LAZY. Planner and Architect produce JSON and never execute
   // commands, so we start with a Docker-free local sandbox (file writes stay
   // confined to the workspace). The real execution sandbox — and, for Docker,
-  // the image build/preflight — is activated only before the first builder that
-  // actually runs, and only when the profile needs it. That is what lets a
-  // static site build with no Docker even when the daemon is absent.
+  // the image build/preflight and the Postgres sidecar — is activated only
+  // before the first builder that actually runs, and only when the profile
+  // needs it. That is what lets a static site build with no Docker at all.
   let sandbox: Sandbox = new LocalSandbox(state.workspaceDir);
   let sandboxActivated = false;
+  let postgres: DockerPostgres | null = null;
   let plan: ProjectPlan | null = null;
   // A forced --profile is shared with the Architect so its contract matches the
   // profile the operator chose (not just which agents run).
   if (opts.planOverrides?.profile) state.stateAccess().write("forcedProfile", opts.planOverrides.profile);
+
   const { provider, model } = resolveModelId();
+  const modelStr = `${provider}/${model}`;
 
   // Resolve + announce the adaptive plan the moment the frozen contract exists.
   // Called both before the Architect's checkpoint (so it can show the plan) and
@@ -168,131 +220,202 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
     bus.emit({ type: "run:plan", profile: resolved.profile, requiredAgents: resolved.requiredAgents, skipped, needsSandbox: resolved.needsSandbox });
     return resolved;
   };
-  const modelStr = `${provider}/${model}`;
 
   bus.emit({ type: "run:start", runId: state.manifest.id, request: state.manifest.request, stack: state.manifest.stack, model: modelStr });
 
   const scope = opts.only ?? (PIPELINE as StageName[]);
   const completed: string[] = [];
   const skippedStages: string[] = [];
+  const usageByStage: Record<string, StageUsage> = {};
+  const recordUsage = (stage: string, u: Usage, toolCalls: number): void => {
+    const prev = usageByStage[stage] ?? { tokens: 0, toolCalls: 0 };
+    usageByStage[stage] = { tokens: prev.tokens + u.totalTokens, toolCalls: prev.toolCalls + toolCalls };
+  };
+  // Build a result, reading `plan`/`completed`/etc. lazily so the profile and
+  // skipped set are always current at the moment of return.
+  const result = (extra: Partial<OrchestratorResult>): OrchestratorResult => ({
+    state,
+    completed,
+    skipped: skippedStages,
+    profile: plan?.profile,
+    aborted: false,
+    usageByStage,
+    ...extra,
+  });
 
-  for (const stageName of PIPELINE as StageName[]) {
-    if (!scope.includes(stageName)) continue;
+  // Base circuit-breaker limits; a budget "retry" doubles them for the re-run.
+  const baseTokens = opts.maxAgentTokens ?? DEFAULT_MAX_AGENT_TOKENS;
+  const baseToolCalls = opts.maxAgentToolCalls ?? DEFAULT_MAX_AGENT_TOOL_CALLS;
 
-    const def = AGENTS[stageName];
+  try {
+    for (const stageName of PIPELINE as StageName[]) {
+      if (!scope.includes(stageName)) continue;
 
-    // Resolve the adaptive plan the moment the frozen contract is available.
-    plan = ensurePlan(plan);
+      const def = AGENTS[stageName];
 
-    // Skip a builder agent the profile does not need: never spawned, no gate.
-    if (plan && def.mode === "builder" && !plan.requiredAgents.includes(stageName)) {
-      if (!skippedStages.includes(stageName)) skippedStages.push(stageName);
-      state.setStage(stageName, "skipped", `skipped: ${plan.profile}`);
-      bus.emit({ type: "stage:skipped", stage: stageName, reason: plan.profile });
-      continue;
-    }
-
-    // Deterministic scaffold happens once, before the first builder that runs.
-    if (def.mode === "builder" && !state.isDone("scaffold")) {
-      scaffoldWorkspace(state, sandbox);
-      state.setStage("scaffold", "done");
-    }
-
-    if (state.isDone(stageName)) {
-      // Resumed: surface it as an instantly-complete stage so the UI shows it.
-      bus.emit({ type: "stage:start", stage: stageName, agent: stageName });
-      bus.emit({ type: "stage:done", stage: stageName, durationMs: 0, artifacts: artifactPathsFor(state, stageName) });
-      completed.push(stageName);
-      continue;
-    }
-
-    // Activate the execution sandbox lazily: only before the first builder that
-    // actually runs, and only when the profile needs command execution. Docker's
-    // image build/preflight happens here — never for planner/architect, and
-    // never at all for a no-build static site (needsSandbox === false).
-    if (plan?.needsSandbox && def.mode === "builder" && !sandboxActivated) {
-      const activated = activateSandbox(bus, state, opts, stageName);
-      if ("infra" in activated) {
-        return { state, completed, skipped: skippedStages, profile: plan?.profile, stoppedAt: stageName, aborted: true, infra: activated.infra };
-      }
-      sandbox = activated.sandbox;
-      sandboxActivated = true;
-    }
-
-    let decision: CheckpointDecision = "continue";
-
-    do {
-      const startedAt = Date.now();
-      let gate: GateResult;
-      let usage: Usage;
-      try {
-        ({ gate, usage } = await runStageWithRetries(def, state, sandbox, opts));
-      } catch (err) {
-        if (err instanceof SandboxInfraError) {
-          // Environment failure, not a code/gate failure. Leave the stage
-          // resumable (do NOT mark it failed) so it retries once the sandbox is
-          // fixed, and report it as an environment error.
-          bus.emit({ type: "env:error", stage: stageName, message: err.message, hint: err.hint });
-          return { state, completed, skipped: skippedStages, profile: plan?.profile, stoppedAt: stageName, aborted: true, infra: { message: err.message, hint: err.hint } };
-        }
-        throw err;
-      }
-
-      // Operator asked to stop (ctrl-q / esc): unwind cleanly as aborted.
-      if (opts.control?.stopRequested) {
-        state.setStage(stageName, "failed", "stopped by operator");
-        bus.emit({ type: "run:error", stage: stageName, error: "stopped by operator" });
-        return { state, completed, skipped: skippedStages, profile: plan?.profile, stoppedAt: stageName, aborted: true };
-      }
-
-      bus.emit({ type: "stage:gate", stage: stageName, passed: gate.pass, detail: gate.detail });
-
-      if (!gate.pass) {
-        state.setStage(stageName, "failed", gate.detail.slice(0, 500));
-        bus.emit({ type: "run:error", stage: stageName, error: gate.detail });
-        return { state, completed, skipped: skippedStages, profile: plan?.profile, stoppedAt: stageName, aborted: true };
-      }
-
-      state.setStage(stageName, "done", gate.detail.slice(0, 500));
-      bus.emit({
-        type: "stage:done",
-        stage: stageName,
-        durationMs: Date.now() - startedAt,
-        artifacts: artifactPathsFor(state, stageName),
-        tokens: usage.totalTokens,
-      });
-      emitTodo(bus, state, [...completed, stageName]);
-      // Classify + announce the plan now (e.g. right after the Architect) so the
-      // checkpoint below can show which agents run/skip and whether Docker is used.
+      // Resolve the adaptive plan the moment the frozen contract is available.
       plan = ensurePlan(plan);
 
-      if (opts.stopAfter && stageName === opts.stopAfter) {
+      // Skip a builder agent the profile does not need: never spawned, no gate.
+      if (plan && def.mode === "builder" && !plan.requiredAgents.includes(stageName)) {
+        if (!skippedStages.includes(stageName)) skippedStages.push(stageName);
+        state.setStage(stageName, "skipped", `skipped: ${plan.profile}`);
+        bus.emit({ type: "stage:skipped", stage: stageName, reason: plan.profile });
+        continue;
+      }
+
+      // Deterministic scaffold happens once, before the first builder that runs.
+      if (def.mode === "builder" && !state.isDone("scaffold")) {
+        scaffoldWorkspace(state, sandbox);
+        state.setStage("scaffold", "done");
+      }
+
+      if (state.isDone(stageName)) {
+        // Resumed: surface it as an instantly-complete stage so the UI shows it.
+        bus.emit({ type: "stage:start", stage: stageName, agent: stageName });
+        bus.emit({ type: "stage:done", stage: stageName, durationMs: 0, artifacts: artifactPathsFor(state, stageName) });
         completed.push(stageName);
-        return { state, completed, skipped: skippedStages, profile: plan?.profile, stoppedAt: stageName, aborted: false };
+        continue;
       }
 
-      decision = "continue";
-      if (!opts.auto && opts.checkpoint) {
-        const artifactPaths = artifactPathsFor(state, stageName);
-        bus.emit({ type: "checkpoint:await", stage: stageName, artifactPaths });
-        decision = await opts.checkpoint({ stage: stageName, gate, state, artifactPaths });
-        if (decision === "quit") {
-          return { state, completed, skipped: skippedStages, profile: plan?.profile, stoppedAt: stageName, aborted: true };
+      // Activate the execution sandbox lazily: only before the first builder that
+      // actually runs, and only when the profile needs command execution. Docker's
+      // image build/preflight + the Postgres sidecar happen here — never for
+      // planner/architect, and never for a no-build static site.
+      if (plan?.needsSandbox && def.mode === "builder" && !sandboxActivated) {
+        const activated = activateSandbox(bus, state, opts, stageName, !!plan.needsDatabase);
+        if ("infra" in activated) {
+          return result({ stoppedAt: stageName, aborted: true, infra: activated.infra });
         }
-        // "retry" re-runs this stage's agent (e.g. the contract needs redoing).
+        sandbox = activated.sandbox;
+        postgres = activated.postgres;
+        sandboxActivated = true;
       }
-    } while (decision === "retry");
 
-    completed.push(stageName);
+      let decision: CheckpointDecision = "continue";
+      let limitScale = 1; // doubled each time the operator retries a budget halt
+
+      do {
+        const startedAt = Date.now();
+        let gate: GateResult;
+        let usage: Usage;
+        let toolCalls: number;
+        let budget: BudgetInfo | undefined;
+        try {
+          ({ gate, usage, toolCalls, budget } = await runStageWithRetries(def, state, sandbox, opts, {
+            maxTokens: Math.round(baseTokens * limitScale),
+            maxToolCalls: Math.round(baseToolCalls * limitScale),
+          }));
+        } catch (err) {
+          if (err instanceof SandboxInfraError) {
+            // Environment failure, not a code/gate failure. Leave the stage
+            // resumable (do NOT mark it failed) so it retries once the sandbox is
+            // fixed, and report it as an environment error.
+            bus.emit({ type: "env:error", stage: stageName, message: err.message, hint: err.hint });
+            return result({ stoppedAt: stageName, aborted: true, infra: { message: err.message, hint: err.hint } });
+          }
+          throw err;
+        }
+        recordUsage(stageName, usage, toolCalls);
+
+        // Operator asked to stop (ctrl-q / esc): unwind cleanly as aborted.
+        if (opts.control?.stopRequested) {
+          state.setStage(stageName, "failed", "stopped by operator");
+          bus.emit({ type: "run:error", stage: stageName, error: "stopped by operator" });
+          return result({ stoppedAt: stageName, aborted: true });
+        }
+
+        // Circuit breaker fired: the agent hit its token or tool-call budget. Its
+        // partial work is already on disk. Do NOT run the gate — offer the
+        // operator continue-with-partial / retry-with-higher-limit / quit.
+        if (budget) {
+          state.setStage(stageName, "failed", `${budget.reason}: ${budget.tokens} tok, ${budget.toolCalls} calls`);
+          bus.emit({
+            type: "stage:budget",
+            stage: stageName,
+            reason: budget.reason,
+            tokens: budget.tokens,
+            maxTokens: budget.maxTokens,
+            toolCalls: budget.toolCalls,
+            maxToolCalls: budget.maxToolCalls,
+          });
+          if (opts.auto || !opts.checkpoint) {
+            // No operator to decide — halt cleanly and leave the stage resumable.
+            return result({ stoppedAt: stageName, aborted: true });
+          }
+          const artifactPaths = artifactPathsFor(state, stageName);
+          bus.emit({ type: "checkpoint:await", stage: stageName, artifactPaths });
+          const d = await opts.checkpoint({ stage: stageName, gate, state, artifactPaths, budget });
+          if (d === "quit") return result({ stoppedAt: stageName, aborted: true });
+          if (d === "retry") {
+            limitScale *= 2; // retry the stage with a higher budget
+            decision = "retry";
+            continue;
+          }
+          // "continue": accept the partial work and move to the next stage.
+          state.setStage(stageName, "done", `${budget.reason} — continued with partial work`);
+          bus.emit({
+            type: "stage:done",
+            stage: stageName,
+            durationMs: Date.now() - startedAt,
+            artifacts: artifactPathsFor(state, stageName),
+            tokens: usage.totalTokens,
+          });
+          completed.push(stageName);
+          break;
+        }
+
+        bus.emit({ type: "stage:gate", stage: stageName, passed: gate.pass, detail: gate.detail });
+
+        if (!gate.pass) {
+          state.setStage(stageName, "failed", gate.detail.slice(0, 500));
+          bus.emit({ type: "run:error", stage: stageName, error: gate.detail });
+          return result({ stoppedAt: stageName, aborted: true });
+        }
+
+        state.setStage(stageName, "done", gate.detail.slice(0, 500));
+        bus.emit({
+          type: "stage:done",
+          stage: stageName,
+          durationMs: Date.now() - startedAt,
+          artifacts: artifactPathsFor(state, stageName),
+          tokens: usage.totalTokens,
+        });
+        emitTodo(bus, state, [...completed, stageName]);
+        // Classify + announce the plan now (e.g. right after the Architect) so the
+        // checkpoint below can show which agents run/skip and whether Docker is used.
+        plan = ensurePlan(plan);
+
+        if (opts.stopAfter && stageName === opts.stopAfter) {
+          completed.push(stageName);
+          return result({ stoppedAt: stageName, aborted: false });
+        }
+
+        decision = "continue";
+        if (!opts.auto && opts.checkpoint) {
+          const artifactPaths = artifactPathsFor(state, stageName);
+          bus.emit({ type: "checkpoint:await", stage: stageName, artifactPaths });
+          decision = await opts.checkpoint({ stage: stageName, gate, state, artifactPaths });
+          if (decision === "quit") {
+            return result({ stoppedAt: stageName, aborted: true });
+          }
+          // "retry" re-runs this stage's agent (e.g. the contract needs redoing).
+        }
+        if (decision !== "retry") completed.push(stageName);
+      } while (decision === "retry");
+    }
+
+    bus.emit({
+      type: "run:done",
+      runId: state.manifest.id,
+      workspacePath: state.workspaceDir,
+      summary: `${completed.length} stage(s) completed: ${completed.join(", ")}`,
+    });
+    return result({ aborted: false });
+  } finally {
+    // Always tear down the Postgres sidecar (and its network) if one was started.
+    postgres?.stop();
   }
-
-  bus.emit({
-    type: "run:done",
-    runId: state.manifest.id,
-    workspacePath: state.workspaceDir,
-    summary: `${completed.length} stage(s) completed: ${completed.join(", ")}`,
-  });
-  return { state, completed, skipped: skippedStages, profile: plan?.profile, aborted: false };
 }
 
 interface PlanTask {
@@ -345,13 +468,27 @@ function artifactPathsFor(state: RunState, stage: string): string[] {
   return [state.workspaceDir];
 }
 
+interface StageLimits {
+  maxTokens: number;
+  maxToolCalls: number;
+}
+
+interface StageRunResult {
+  gate: GateResult;
+  usage: Usage;
+  toolCalls: number;
+  /** Present when the circuit breaker halted the agent (not a gate outcome). */
+  budget?: BudgetInfo;
+}
+
 /** Runs one stage, re-spawning on gate failure with the failure appended. */
 async function runStageWithRetries(
   def: AgentDef,
   state: RunState,
   sandbox: Sandbox,
   opts: OrchestratorOptions,
-): Promise<{ gate: GateResult; usage: Usage }> {
+  limits: StageLimits,
+): Promise<StageRunResult> {
   const { bus } = opts;
   // Per-agent model override: an explicit --model wins; otherwise a built-in
   // per-agent default (which may point at a different provider) applies; else
@@ -361,6 +498,7 @@ async function runStageWithRetries(
   const model = opts.models?.[def.name] ?? AGENT_MODEL_DEFAULTS[def.name];
   let lastGate: GateResult = { pass: false, detail: "not run" };
   const usage: Usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+  let toolCallsTotal = 0;
   let extraContext = "";
 
   for (let attempt = 1; attempt <= opts.maxAttempts; attempt++) {
@@ -388,6 +526,8 @@ async function runStageWithRetries(
       ctx,
       model,
       maxIterations: def.maxIterations,
+      maxTokens: limits.maxTokens,
+      maxToolCalls: limits.maxToolCalls,
       drainSteers: opts.drainSteers,
       control: opts.control,
       onEvent: (e) => {
@@ -400,6 +540,15 @@ async function runStageWithRetries(
           bus.emit({ type: "agent:thinking", stage: def.name, text: e.text });
         } else if (e.type === "usage" && e.usage) {
           bus.emit({ type: "usage", model: e.model ?? "", ...e.usage });
+        } else if (e.type === "budget" && e.budget) {
+          bus.emit({
+            type: "agent:budget",
+            stage: def.name,
+            tokens: e.budget.tokens,
+            maxTokens: e.budget.maxTokens,
+            toolCalls: e.budget.toolCalls,
+            maxToolCalls: e.budget.maxToolCalls,
+          });
         } else if (e.type === "tool_call") {
           // Only the call becomes a transcript line (⚙ tool args); the result
           // still goes to the disk log above, keeping the feed uncluttered.
@@ -410,11 +559,30 @@ async function runStageWithRetries(
       },
     });
     accumulate(usage, result.usage);
+    toolCallsTotal += result.toolCalls;
     state.appendLog(def.name, `\n=== FINAL (attempt ${attempt}) ===\n${result.finalText}\n`);
 
     // Operator stop: don't run the gate or retry — hand control back to unwind.
     if (opts.control?.stopRequested) {
-      return { gate: { pass: false, detail: "stopped by operator" }, usage };
+      return { gate: { pass: false, detail: "stopped by operator" }, usage, toolCalls: toolCallsTotal };
+    }
+
+    // Circuit breaker halted the agent (token or tool-call budget). This is not
+    // a gate outcome and not retryable here — surface it so the orchestrator can
+    // present the budget checkpoint.
+    if (result.stopReason === "budget-exceeded" || result.stopReason === "iteration-limit") {
+      return {
+        gate: { pass: false, detail: `agent halted: ${result.stopReason}` },
+        usage,
+        toolCalls: toolCallsTotal,
+        budget: {
+          reason: result.stopReason,
+          tokens: usage.totalTokens,
+          maxTokens: limits.maxTokens,
+          toolCalls: toolCallsTotal,
+          maxToolCalls: limits.maxToolCalls,
+        },
+      };
     }
 
     // Contract agents emit JSON as their final message; persist it as an artifact.
@@ -434,12 +602,12 @@ async function runStageWithRetries(
       sandbox,
       log: (m) => bus.emit({ type: "stage:progress", stage: def.name, tool: "gate", summary: m }),
     });
-    if (lastGate.pass) return { gate: lastGate, usage };
+    if (lastGate.pass) return { gate: lastGate, usage, toolCalls: toolCallsTotal };
 
     emitRecoverable(bus, def.name, attempt, opts.maxAttempts, lastGate.detail);
     extraContext = failureContext(lastGate.detail);
   }
-  return { gate: lastGate, usage };
+  return { gate: lastGate, usage, toolCalls: toolCallsTotal };
 }
 
 /**

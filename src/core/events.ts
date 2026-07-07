@@ -14,6 +14,9 @@ export interface TodoItem {
   done: boolean;
 }
 
+/** A budget reason for a halted stage. */
+export type BudgetReason = "budget-exceeded" | "iteration-limit";
+
 export type PipelineEvent =
   | { type: "run:start"; runId: string; request: string; stack: string; model: string }
   // The adaptive plan, emitted once the Architect's contract is classified.
@@ -25,10 +28,15 @@ export type PipelineEvent =
   | { type: "agent:token"; stage: string; text: string }
   | { type: "agent:thinking"; stage: string; text: string }
   | { type: "agent:todo"; stage: string; items: TodoItem[] }
+  // Live circuit-breaker meter for the running agent (tokens + tool calls vs caps).
+  | { type: "agent:budget"; stage: string; tokens: number; maxTokens: number; toolCalls: number; maxToolCalls: number }
   | { type: "stage:gate"; stage: string; passed: boolean; detail: string }
   | { type: "stage:done"; stage: string; durationMs: number; artifacts: string[]; tokens?: number }
   | { type: "usage"; model: string; promptTokens: number; completionTokens: number; totalTokens: number }
   | { type: "checkpoint:await"; stage: string; artifactPaths: string[] }
+  // A stage was halted by the circuit breaker (token or tool-call budget). Its
+  // partial work is on disk; the operator is offered continue / retry / quit.
+  | { type: "stage:budget"; stage: string; reason: BudgetReason; tokens: number; maxTokens: number; toolCalls: number; maxToolCalls: number }
   | { type: "run:done"; runId: string; workspacePath: string; summary: string; repoUrl?: string }
   | { type: "run:error"; stage: string; error: string }
   // Environment/infrastructure failure (e.g. Docker daemon down, image missing):

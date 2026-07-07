@@ -9,6 +9,11 @@ import { truncate } from "./format.js";
  * the transcript to styled lines for the scroll viewport.
  */
 
+/** Compact token count for meters/labels: 412345 -> "412K". */
+export function fmtTok(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(0)}K` : String(n);
+}
+
 export type NodeStatus = "pending" | "running" | "done" | "failed" | "skipped";
 
 export interface TreeNode {
@@ -30,9 +35,20 @@ export interface TranscriptBlock {
   items?: TodoItem[];
 }
 
+/** Live circuit-breaker meter for the currently-running agent. */
+export interface BudgetMeter {
+  stage: string;
+  tokens: number;
+  maxTokens: number;
+  toolCalls: number;
+  maxToolCalls: number;
+}
+
 export interface CheckpointView {
   stage: string;
   artifactPaths: string[];
+  /** Set when the pause is a circuit-breaker halt (offers retry-with-higher-limit). */
+  budget?: { reason: string; tokens: number; maxTokens: number; toolCalls: number; maxToolCalls: number };
 }
 
 export interface TuiModel {
@@ -46,6 +62,8 @@ export interface TuiModel {
   blocks: TranscriptBlock[];
   tree: TreeNode[];
   totalTokens: number;
+  /** Live budget meter for the running agent (null between stages). */
+  budget: BudgetMeter | null;
   checkpoint: CheckpointView | null;
   finished: boolean;
   aborted: boolean;
@@ -69,6 +87,7 @@ export function initModel(version: string, startTs: number): TuiModel {
     blocks: [],
     tree: AGENTS.map((name) => ({ name, status: "pending" })),
     totalTokens: 0,
+    budget: null,
     checkpoint: null,
     finished: false,
     aborted: false,
@@ -116,6 +135,8 @@ export function applyEvent(m: TuiModel, e: StampedEvent): TuiModel {
       const started = {
         ...m,
         tree: setNode(m.tree, e.stage, "running"),
+        // New agent starting: clear the previous agent's budget meter.
+        budget: null,
         errorStage: m.errorStage === e.stage ? undefined : m.errorStage,
       };
       // Only add a handoff divider when actually switching agents.
@@ -157,6 +178,29 @@ export function applyEvent(m: TuiModel, e: StampedEvent): TuiModel {
 
     case "usage":
       return { ...m, totalTokens: m.totalTokens + e.totalTokens };
+
+    case "agent:budget":
+      return {
+        ...m,
+        budget: {
+          stage: e.stage,
+          tokens: e.tokens,
+          maxTokens: e.maxTokens,
+          toolCalls: e.toolCalls,
+          maxToolCalls: e.maxToolCalls,
+        },
+      };
+
+    case "stage:budget": {
+      // Circuit breaker halted the stage. Mark it failed and surface the reason;
+      // the checkpoint prompt (below) offers continue / retry-higher / quit.
+      const label =
+        e.reason === "budget-exceeded"
+          ? `hit token budget (${fmtTok(e.tokens)}/${fmtTok(e.maxTokens)})`
+          : `hit tool-call limit (${e.toolCalls}/${e.maxToolCalls})`;
+      const marked = { ...m, tree: setNode(m.tree, e.stage, "failed"), errorStage: e.stage };
+      return push(marked, { kind: "gate", stage: e.stage, passed: false, detail: `circuit breaker: ${label}` });
+    }
 
     case "checkpoint:await":
       return { ...m, checkpoint: { stage: e.stage, artifactPaths: e.artifactPaths } };

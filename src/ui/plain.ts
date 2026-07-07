@@ -11,8 +11,17 @@ import { termWidth, truncate, clockTime, humanDuration, humanTokens, estimateCos
  * beyond writing lines.
  */
 
+/** Circuit-breaker context for a budget checkpoint (offers retry-with-higher-limit). */
+export interface CheckpointBudget {
+  reason: string;
+  tokens: number;
+  maxTokens: number;
+  toolCalls: number;
+  maxToolCalls: number;
+}
+
 export interface Renderer {
-  awaitCheckpoint(stage: string, artifactPaths: string[]): Promise<CheckpointDecision>;
+  awaitCheckpoint(stage: string, artifactPaths: string[], budget?: CheckpointBudget): Promise<CheckpointDecision>;
   /** Ask the operator to approve a non-allowlisted command. */
   confirm(question: string): Promise<boolean>;
   /** Pending steer/instruction lines submitted via the UI (TUI only). */
@@ -69,6 +78,17 @@ export function attachPlainRenderer(bus: EventBus, opts: { model?: string } = {}
       case "usage":
         // Per-call usage is noisy for a line log; totals come from stage:done.
         break;
+      case "agent:budget":
+        // Live meter is for the TUI; the line log would be far too noisy.
+        break;
+      case "stage:budget": {
+        const detail =
+          e.reason === "budget-exceeded"
+            ? `token budget (${humanTokens(e.tokens)}/${humanTokens(e.maxTokens)} tok)`
+            : `tool-call limit (${e.toolCalls}/${e.maxToolCalls} calls)`;
+        line(e.ts, chalk.yellow(`⚠ ${e.stage} hit its ${detail}`) + chalk.dim(" — partial work saved"));
+        break;
+      }
       case "stage:gate":
         line(
           e.ts,
@@ -106,13 +126,22 @@ export function attachPlainRenderer(bus: EventBus, opts: { model?: string } = {}
   });
 
   return {
-    async awaitCheckpoint(stage: string, artifactPaths: string[]): Promise<CheckpointDecision> {
+    async awaitCheckpoint(stage: string, artifactPaths: string[], budget?: CheckpointBudget): Promise<CheckpointDecision> {
       // Prefer a raw single keypress; fall back to line input if unavailable.
-      process.stdout.write(
-        chalk.yellow(`\n⏸ ${stage} complete. `) +
-          chalk.dim(`Inspect: ${artifactPaths.join(", ")}\n`) +
-          `  ${chalk.bold("[c]")} continue   ${chalk.bold("[r]")} retry stage   ${chalk.bold("[q]")} quit  `,
-      );
+      if (budget) {
+        const reason = budget.reason === "budget-exceeded" ? "token budget" : "tool-call limit";
+        process.stdout.write(
+          chalk.yellow(`\n⚠ ${stage} hit its ${reason}. `) +
+            chalk.dim(`Partial work saved to: ${artifactPaths.join(", ")}\n`) +
+            `  ${chalk.bold("[c]")} continue w/ partial   ${chalk.bold("[r]")} retry higher limit   ${chalk.bold("[q]")} quit  `,
+        );
+      } else {
+        process.stdout.write(
+          chalk.yellow(`\n⏸ ${stage} complete. `) +
+            chalk.dim(`Inspect: ${artifactPaths.join(", ")}\n`) +
+            `  ${chalk.bold("[c]")} continue   ${chalk.bold("[r]")} retry stage   ${chalk.bold("[q]")} quit  `,
+        );
+      }
       const key = await readOneKey(["c", "r", "q"]);
       process.stdout.write("\n");
       return key === "r" ? "retry" : key === "q" ? "quit" : "continue";

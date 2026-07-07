@@ -17,7 +17,7 @@ import {
   type StyledLine,
 } from "./model.js";
 import { theme, TAGLINE } from "./theme.js";
-import type { Renderer } from "./plain.js";
+import type { Renderer, CheckpointBudget } from "./plain.js";
 import { estimateCostUsd, formatCostUsd } from "./format.js";
 
 /**
@@ -222,12 +222,34 @@ function AgentTree({ tree, height, frame }: { tree: TreeNode[]; height: number; 
   );
 }
 
+/** Colour for a budget fraction: green under 80%, yellow at 80%, red at 100%. */
+function budgetColor(used: number, max: number): string | undefined {
+  if (max <= 0) return undefined;
+  const frac = used / max;
+  if (frac >= 1) return "red";
+  if (frac >= 0.8) return "yellow";
+  return undefined;
+}
+
 function UsageBox({ m }: { m: TuiModel }): React.ReactElement {
   const cost = formatCostUsd(estimateCostUsd(m.totalTokens, m.model));
+  const b = m.budget;
+  const tokColor = b ? budgetColor(b.tokens, b.maxTokens) : undefined;
+  const callColor = b ? budgetColor(b.toolCalls, b.maxToolCalls) : undefined;
   return (
     <Box flexDirection="column" borderStyle="round" borderColor={theme.accent} paddingX={1}>
       <Text color={theme.accent}>{m.model || "—"}</Text>
       <Text>{tokensBig(m.totalTokens)} tokens</Text>
+      {b ? (
+        <>
+          <Text color={tokColor}>
+            {tokensBig(b.tokens)} / {tokensBig(b.maxTokens)} tok
+          </Text>
+          <Text color={callColor}>
+            {b.toolCalls} / {b.maxToolCalls} calls
+          </Text>
+        </>
+      ) : null}
       <Text dimColor>
         ~{cost} · v{m.version}
       </Text>
@@ -242,10 +264,15 @@ function UsageBox({ m }: { m: TuiModel }): React.ReactElement {
  */
 function StatusBar({ m, cols }: { m: TuiModel; cols: number }): React.ReactElement {
   if (m.checkpoint) {
+    const budget = m.checkpoint.budget;
     const targets = m.checkpoint.artifactPaths.map(baseName).join(", ");
-    const text = `[c]ontinue [r]etry [q]uit · ${targets}`;
+    // Kept to a single truncated row (like the normal checkpoint bar) so it can
+    // never wrap and tip the column past `rows`.
+    const text = budget
+      ? `⚠ ${m.checkpoint.stage} hit its ${budget.reason === "budget-exceeded" ? "token budget" : "tool-call limit"} · [c]ontinue partial [r]etry higher [q]uit`
+      : `[c]ontinue [r]etry [q]uit · ${targets}`;
     return (
-      <Text color={theme.accent} wrap="truncate-end">
+      <Text color={budget ? "yellow" : theme.accent} wrap="truncate-end">
         {clip1(text, cols)}
       </Text>
     );
@@ -510,9 +537,9 @@ export function attachTuiRenderer(bus: EventBus, opts: { model?: string; control
   };
 
   return {
-    awaitCheckpoint(stage: string, artifactPaths: string[]): Promise<CheckpointDecision> {
+    awaitCheckpoint(stage: string, artifactPaths: string[], budget?: CheckpointBudget): Promise<CheckpointDecision> {
       return new Promise((resolve) => {
-        store.model = { ...store.model, checkpoint: { stage, artifactPaths } };
+        store.model = { ...store.model, checkpoint: { stage, artifactPaths, budget } };
         store.checkpointResolver = resolve;
       });
     },

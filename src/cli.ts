@@ -54,6 +54,8 @@ async function main() {
     .option("--agents <list>", "force an explicit comma-separated agent set (architect always included)")
     .option("--force-backend", "pull the backend agent back in (implies sandbox + database)", false)
     .option("--max-attempts <n>", "gate retry attempts per stage", "2")
+    .option("--max-agent-tokens <n>", "per-agent token budget (circuit breaker)")
+    .option("--max-agent-iterations <n>", "per-agent tool-call budget (circuit breaker)")
     .option("--runs-dir <path>", "runs directory", "runs")
     .option("--model <spec...>", "per-agent model override, e.g. architect=openai/gpt-4o")
     .addHelpText("after", "\n  --no-backend             drop the backend agent (adaptive-pipeline toggle)")
@@ -106,6 +108,10 @@ async function main() {
     models[spec.slice(0, eq)] = spec.slice(eq + 1);
   }
 
+  // Circuit-breaker budgets: CLI flag wins, then env var, then the loop default.
+  const maxAgentTokens = positiveIntOr(opts.maxAgentTokens ?? process.env.MAX_AGENT_TOKENS, undefined);
+  const maxAgentToolCalls = positiveIntOr(opts.maxAgentIterations ?? process.env.MAX_AGENT_ITERATIONS, undefined);
+
   const runsRoot = resolve(REPO_ROOT, opts.runsDir);
   const { provider, model } = resolveModelId();
 
@@ -147,6 +153,8 @@ async function main() {
       stopAfter: opts.stopAfter as StageName | undefined,
       only: only as StageName[] | undefined,
       maxAttempts: Number(opts.maxAttempts) || 2,
+      maxAgentTokens,
+      maxAgentToolCalls,
       sandbox: { backend: backendIntent },
       localConsent,
       planOverrides,
@@ -155,7 +163,7 @@ async function main() {
       control,
       drainSteers: () => renderer.drainSteers?.() ?? [],
       confirm: opts.auto ? undefined : (question) => renderer.confirm(question),
-      checkpoint: opts.auto ? undefined : (info) => renderer.awaitCheckpoint(info.stage, info.artifactPaths),
+      checkpoint: opts.auto ? undefined : (info) => renderer.awaitCheckpoint(info.stage, info.artifactPaths, info.budget),
     });
 
     renderer.stop();
@@ -184,8 +192,15 @@ async function main() {
 }
 
 function printFinalSummary(result: import("./core/orchestrator.js").OrchestratorResult): void {
+  const usage = result.usageByStage ?? {};
+  const usageStr = (s: string): string => {
+    const u = usage[s];
+    if (!u) return "";
+    const tok = u.tokens >= 1000 ? `${(u.tokens / 1000).toFixed(0)}K` : String(u.tokens);
+    return chalk.dim(`  (${tok} tok · ${u.toolCalls} calls)`);
+  };
   const recap = PIPELINE.filter((s) => result.completed.includes(s))
-    .map((s) => `  ${chalk.green("✓")} ${s}`)
+    .map((s) => `  ${chalk.green("✓")} ${s}${usageStr(s)}`)
     .join("\n");
   const skips = PIPELINE.filter((s) => result.skipped.includes(s))
     .map((s) => `  ${chalk.dim("–")} ${chalk.dim(`${s} (skipped: ${result.profile ?? "profile"})`)}`)
@@ -200,6 +215,13 @@ function printFinalSummary(result: import("./core/orchestrator.js").Orchestrator
     ? chalk.red(`STOPPED${result.stoppedAt ? ` at ${result.stoppedAt}` : ""}`)
     : chalk.green(result.stoppedAt ? `stopped after ${result.stoppedAt}` : "complete");
   process.stdout.write(`${chalk.bold("status")}    ${status}\n`);
+}
+
+/** Parse a positive integer from a CLI/env value; falls back on empty/invalid. */
+function positiveIntOr(value: string | undefined, fallback: number | undefined): number | undefined {
+  if (value === undefined || value === "") return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 
 const CONSENT_MARKER = join(homedir(), ".elevateurskills-consent");

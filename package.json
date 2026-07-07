@@ -22,7 +22,8 @@
     "smoke:llm": "tsx scripts/smoke-llm.ts",
     "smoke:loop": "tsx scripts/smoke-loop.ts",
     "smoke:tui": "tsx scripts/smoke-tui.tsx",
-    "smoke:sandbox": "tsx scripts/smoke-sandbox.ts"
+    "smoke:sandbox": "tsx scripts/smoke-sandbox.ts",
+    "smoke:limits": "tsx scripts/smoke-limits.ts"
   },
   "engines": {
     "node": ">=20"

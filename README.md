@@ -199,9 +199,21 @@ never the pipeline.
 Every specialist runs the same loop (`src/core/loop.ts`): the model is given a
 role, a task, and a subset of tools. It calls a tool, sees the **real** result
 (including stack traces and failing tests), corrects, and repeats until it stops
-calling tools or hits the iteration cap. Tools execute inside a sandbox
+calling tools or a limit halts it. Tools execute inside a sandbox
 (`src/core/sandbox.ts`) — a Docker container when Docker is available, otherwise
 a local sandbox confined to the run's `workspace/` directory.
+
+**Circuit breaker.** An agent can't spin forever. Each one has a hard token
+budget (default 500K, `MAX_AGENT_TOKENS` / `--max-agent-tokens`) and tool-call
+budget (default 50, `MAX_AGENT_ITERATIONS` / `--max-agent-iterations`); at 80% it
+gets a "wrap up" nudge, at 100% it halts. Spin detection watches `run_shell`: the
+same failing command three times, or five consecutive failures, injects a nudge
+to stop fighting a likely environment problem and report the blocker. When a
+budget is hit the stage is **not** silently continued — its partial work is saved
+and you get a checkpoint: **[c]** continue with partial work · **[r]** retry with
+a doubled limit · **[q]** quit. The usage box shows the live meter
+(`412K / 500K tokens · 34 / 50 calls`), turning yellow at 80% and red at 100%,
+and the final summary lists token/tool-call usage per agent.
 
 ---
 
@@ -224,6 +236,8 @@ elevateurskills [options]
   --force-backend          pull the backend agent back in (implies sandbox + db)
   --no-backend             drop the backend agent
   --max-attempts <n>       gate retries per stage (default: 2)
+  --max-agent-tokens <n>   per-agent token budget (circuit breaker; default 500K)
+  --max-agent-iterations <n>  per-agent tool-call budget (circuit breaker; default 50)
   --model <agent=spec>     per-agent model override (repeatable)
 ```
 
@@ -265,6 +279,10 @@ ANTHROPIC_API_KEY=
 
 # Optional: override base URL for local / OpenAI-compatible endpoints
 # LLM_API_BASE=
+
+# Optional: circuit-breaker budgets per agent (CLI flags override these)
+# MAX_AGENT_TOKENS=500000
+# MAX_AGENT_ITERATIONS=50
 ```
 
 `ELEVATE_LLM` is `provider/model`. To switch providers you change that one line
@@ -326,8 +344,14 @@ the daemon is reachable, else local).
 
 ### Docker backend (recommended, real isolation)
 
-Each command runs in a throwaway container built from `sandbox/Dockerfile`
-(Node 20 + Postgres client + Chromium libs), hardened by default:
+Each command runs in a throwaway container built from `sandbox/Dockerfile`. The
+image is **pre-configured for the opinionated stack** (full `node:20-bookworm`,
+not alpine — Prisma's prebuilt query engines need glibc + OpenSSL, which is what
+makes `prisma generate`/`migrate` load the engine on the first try instead of the
+agent fighting `libquery_engine*.so.node` failures). It also carries the Postgres
+client, the Chromium libs the frontend smoke test needs, and a globally-installed
+Prisma/TypeScript/tsx toolchain so `npx prisma …` doesn't re-download on every
+run. It is hardened by default:
 
 - only the run's `workspace/` is mounted; the working dir is that mount
 - all Linux capabilities dropped, `no-new-privileges`, memory/CPU/pids capped
@@ -337,6 +361,20 @@ Each command runs in a throwaway container built from `sandbox/Dockerfile`
   project code can never see it
 - default bridge network (outbound for `npm`/`prisma`), never the host network
 - per-command timeout that kills the container
+
+**Database.** A working `DATABASE_URL` is always injected into the sandbox, so
+the agent never has to invent or configure one. For a Docker run that will build
+the backend, a throwaway `postgres:16-alpine` sidecar is started on a per-run
+Docker network and `DATABASE_URL` points the sandbox at it by container name;
+it's torn down when the run ends (or on ctrl-q). If the sidecar can't start the
+run continues against a placeholder URL — the backend's repository pattern keeps
+tests runnable in-memory (`NODE_ENV=test`) without a live database. The local
+backend always uses the placeholder URL.
+
+Prisma downloads its query/schema engines from `binaries.prisma.io`; the image
+build warms them in when it can reach that host, otherwise they download lazily on
+first `prisma generate`. Either way, that host must be reachable from the build or
+the container. (On IPv6-only egress it may not resolve — that CDN is IPv4-only.)
 
 The image is **built locally** from `sandbox/Dockerfile`, never pulled. On
 startup (before the planner runs) a preflight checks the daemon and builds the
