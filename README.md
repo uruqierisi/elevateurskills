@@ -298,7 +298,21 @@ Each command runs in a throwaway container built from `sandbox/Dockerfile`
 - default bridge network (outbound for `npm`/`prisma`), never the host network
 - per-command timeout that kills the container
 
+The image is **built locally** from `sandbox/Dockerfile`, never pulled. On
+startup (before the planner runs) a preflight checks the daemon and builds the
+image if missing, so a broken sandbox fails fast instead of after burning tokens.
+The image is tagged with a hash of the Dockerfile
+(`elevateurskills-sandbox:<hash>`), so repeat runs reuse the cached image and a
+change to the Dockerfile automatically triggers a rebuild. A daemon/image/mount
+failure mid-run is reported as an **environment error** (not a code failure) and
+the stage is left resumable — fix the environment and re-run with `--resume`.
+
 Use Docker for anything untrusted or unattended.
+
+> **WSL tip:** if you're on Windows using WSL, run the project from your Linux
+> home (`~/...`), not from a Windows path (`/mnt/c/...`). Bind-mounting a Windows
+> path into the container is significantly slower and can hit permission quirks;
+> the Linux filesystem avoids both.
 
 ### Local backend (fallback — NOT real isolation)
 
