@@ -13,6 +13,8 @@ import { termWidth, truncate, clockTime, humanDuration, humanTokens, estimateCos
 
 export interface Renderer {
   awaitCheckpoint(stage: string, artifactPaths: string[]): Promise<CheckpointDecision>;
+  /** Pending steer/instruction lines submitted via the UI (TUI only). */
+  drainSteers?(): string[];
   stop(): void;
 }
 
@@ -41,6 +43,17 @@ export function attachPlainRenderer(bus: EventBus, opts: { model?: string } = {}
         break;
       case "agent:token":
         line(e.ts, chalk.dim(`  ${e.stage} 💬 ${e.text}`));
+        break;
+      case "agent:thinking":
+        line(e.ts, chalk.magenta(`  ${e.stage} 🧠 `) + chalk.dim(e.text));
+        break;
+      case "agent:todo": {
+        const done = e.items.filter((i) => i.done).length;
+        line(e.ts, chalk.dim(`  ${e.stage} 📋 plan ${done}/${e.items.length}`));
+        break;
+      }
+      case "usage":
+        // Per-call usage is noisy for a line log; totals come from stage:done.
         break;
       case "stage:gate":
         line(

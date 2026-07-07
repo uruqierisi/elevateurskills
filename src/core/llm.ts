@@ -56,6 +56,8 @@ export interface CompletionResult {
   usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
   /** The concrete model id sent to the provider. */
   model: string;
+  /** Provider reasoning text, when exposed (e.g. DeepSeek reasoner). */
+  reasoning?: string;
 }
 
 const DEFAULT_MODEL = "deepseek/deepseek-chat";
@@ -154,6 +156,7 @@ export async function chatCompletion(
             }
           : undefined,
         model,
+        reasoning: choice.message.reasoning_content ?? undefined,
       };
     } catch (err) {
       lastErr = err;
@@ -167,7 +170,7 @@ export async function chatCompletion(
 
 interface OpenAiResponse {
   choices?: Array<{
-    message: { content: string | null; tool_calls?: ToolCall[] };
+    message: { content: string | null; tool_calls?: ToolCall[]; reasoning_content?: string };
     finish_reason?: string;
   }>;
   usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };

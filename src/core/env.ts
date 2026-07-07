@@ -1,4 +1,4 @@
-import { existsSync, copyFileSync } from "node:fs";
+import { existsSync, copyFileSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import dotenv from "dotenv";
@@ -33,6 +33,16 @@ export function loadEnv(): void {
   }
 
   dotenv.config({ path: ENV_PATH });
+}
+
+/** Reads the package version from the repo/package root; safe fallback. */
+export function packageVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(resolve(REPO_ROOT, "package.json"), "utf8")) as { version?: string };
+    return pkg.version ?? "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
 }
 
 /** Loads env then asserts a usable API key is present. */

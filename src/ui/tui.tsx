@@ -1,37 +1,68 @@
 import React, { useEffect, useState } from "react";
 import { render, Box, Text, useInput, type Instance } from "ink";
 import Spinner from "ink-spinner";
-import type { EventBus } from "../core/events.js";
-import type { CheckpointDecision } from "../core/events.js";
-import { PIPELINE } from "../core/agents.js";
-import { initModel, applyEvent, clearCheckpoint, type TuiModel, type StageView } from "./model.js";
+import TextInput from "ink-text-input";
+import type { EventBus, CheckpointDecision } from "../core/events.js";
+import { packageVersion } from "../core/env.js";
+import {
+  initModel,
+  applyEvent,
+  clearCheckpoint,
+  enterMain,
+  orchestratorStatus,
+  transcriptLines,
+  type TuiModel,
+  type TreeNode,
+  type NodeStatus,
+  type StyledLine,
+} from "./model.js";
+import { theme, TAGLINE } from "./theme.js";
 import type { Renderer } from "./plain.js";
-import { termWidth, truncate, humanDuration, humanTokens, estimateCostUsd, formatCostUsd } from "./format.js";
+import { estimateCostUsd, formatCostUsd } from "./format.js";
 
 /**
- * Ink (React-for-the-terminal) TUI renderer: a single non-scrolling frame
- * redrawn in place. It is a dumb projection of the reducer model in model.ts —
- * all "what to show" logic lives there, so the component stays declarative.
+ * Strix-style TUI: a splash, then a two-column layout — a scrollable transcript
+ * on the left, an agent tree + model/usage box on the right — with a status bar
+ * and steer input across the bottom. It is a pure projection of the reducer in
+ * model.ts; all rendering data comes from there.
  *
- * Re-renders are throttled to ~10fps via a tick, which coalesces bursts of
- * rapid tool events so the pipeline is never slowed by rendering.
+ * Ink has no viewport/scroll primitive, so the transcript is scrolled manually:
+ * the reducer flattens blocks to styled lines and this component slices the
+ * window that fits `process.stdout.rows`, re-slicing on resize.
  */
 
-/** Shared mutable store: bus handler writes; component reads on each tick. */
-export interface Store {
+const SIDEBAR_WIDTH = 28;
+const INPUT_HEIGHT = 3; // bordered single line
+const STATUS_HEIGHT = 1;
+
+interface Store {
   model: TuiModel;
   checkpointResolver: ((d: CheckpointDecision) => void) | null;
+  steers: string[];
+  onQuit: (() => void) | null;
 }
 
-const STAGES_TO_SHOW = PIPELINE as string[];
-// The contract-decoupled pair that can run in parallel after the freeze.
-const PARALLEL_PAIR = new Set(["backend", "frontend"]);
+// --- small helpers --------------------------------------------------------
 
-function glyphFor(stage: StageView): React.ReactElement {
-  switch (stage.status) {
+function termSize(): { cols: number; rows: number } {
+  return { cols: process.stdout.columns || 80, rows: process.stdout.rows || 24 };
+}
+
+function tokensBig(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
+  return String(n);
+}
+
+function shortPath(p: string): string {
+  const idx = p.replace(/\\/g, "/").indexOf("/runs/");
+  return idx >= 0 ? p.slice(idx + 1) : p;
+}
+
+function nodeGlyph(status: NodeStatus): React.ReactElement {
+  switch (status) {
     case "running":
       return (
-        <Text color="cyan">
+        <Text color={theme.accent}>
           <Spinner type="dots" />
         </Text>
       );
@@ -44,167 +75,249 @@ function glyphFor(stage: StageView): React.ReactElement {
   }
 }
 
-function StageRow({ stage }: { stage: StageView }): React.ReactElement {
-  const gutter = PARALLEL_PAIR.has(stage.name) ? "∥" : " ";
-  const meta: string[] = [];
-  if (stage.durationMs !== undefined) meta.push(humanDuration(stage.durationMs));
-  if (stage.tokens) meta.push(`${humanTokens(stage.tokens)} tok`);
-  const dim = stage.status === "pending";
-  return (
-    <Box>
-      <Text dimColor>{gutter} </Text>
-      <Box width={2}>{glyphFor(stage)}</Box>
-      <Text dimColor={dim} bold={stage.status === "running"}>
-        {stage.name.padEnd(10)}
-      </Text>
-      {meta.length > 0 && <Text dimColor> {meta.join(" · ")}</Text>}
-    </Box>
-  );
-}
+// --- regions --------------------------------------------------------------
 
-function Header({ m }: { m: TuiModel }): React.ReactElement {
-  const width = termWidth();
+const LOGO = ["█████  █   █  █████", "█      █   █  █    ", "████   █   █  █████", "█      █   █      █", "█████  █████  █████"];
+
+function Splash({ m }: { m: TuiModel }): React.ReactElement {
   return (
-    <Box flexDirection="column" marginBottom={1}>
-      <Box>
-        <Text color="magentaBright" bold>
-          elevateurskills
-        </Text>
-        <Text dimColor> · {truncate(m.request || "(resuming)", Math.max(20, width - 40))}</Text>
+    <Box height={termSize().rows} alignItems="center" justifyContent="center">
+      <Box flexDirection="column" alignItems="center" borderStyle="round" borderColor={theme.accent} paddingX={4} paddingY={1}>
+        {LOGO.map((l, i) => (
+          <Text key={i} color={theme.accent} bold>
+            {l}
+          </Text>
+        ))}
+        <Box marginTop={1} flexDirection="column" alignItems="center">
+          <Text bold>Welcome to elevateurskills!</Text>
+          <Text dimColor>v{m.version}</Text>
+          <Text dimColor>{TAGLINE}</Text>
+          <Box marginTop={1}>
+            <Text color={theme.accent}>
+              <Spinner type="dots" /> Starting pipeline…
+            </Text>
+          </Box>
+        </Box>
       </Box>
-      <Text dimColor>
-        {m.model || "—"} · {m.stack || "—"} · run {m.runId || "…"}
-      </Text>
     </Box>
   );
 }
 
-function Active({ m }: { m: TuiModel }): React.ReactElement | null {
-  if (!m.activeStage) return null;
-  const width = termWidth();
-  const tail = m.tail.slice(-6);
+function Transcript({ lines, height, width, scrollOffset }: { lines: StyledLine[]; height: number; width: number; scrollOffset: number }): React.ReactElement {
+  const viewport = Math.max(1, height);
+  const total = lines.length;
+  const maxStart = Math.max(0, total - viewport);
+  const start = Math.max(0, maxStart - scrollOffset);
+  const visible = lines.slice(start, start + viewport);
+  while (visible.length < viewport) visible.push({ text: "" });
+
+  // Scrollbar thumb position along the viewport.
+  const thumbRow = maxStart === 0 ? -1 : Math.round((start / maxStart) * (viewport - 1));
+
   return (
-    <Box flexDirection="column" marginTop={1}>
-      <Text>
-        <Text color="cyan" bold>
-          ▶ {m.activeStage}
-        </Text>
-        {m.lastTool ? <Text dimColor>  {truncate(m.lastTool, Math.max(10, width - m.activeStage.length - 6))}</Text> : null}
-      </Text>
-      {tail.map((line, i) => (
-        <Text key={i} dimColor>
-          {"  "}
-          {truncate(line, Math.max(10, width - 3))}
-        </Text>
-      ))}
+    <Box flexDirection="row" height={viewport}>
+      <Box flexDirection="column" width={width - 1}>
+        {visible.map((ln, i) => (
+          <Text key={i} color={ln.color} dimColor={ln.dim} italic={ln.italic} bold={ln.bold} wrap="truncate-end">
+            {ln.text || " "}
+          </Text>
+        ))}
+      </Box>
+      <Box flexDirection="column" width={1}>
+        {Array.from({ length: viewport }).map((_, i) => (
+          <Text key={i} color={theme.accent} dimColor={i !== thumbRow}>
+            {i === thumbRow ? "█" : "│"}
+          </Text>
+        ))}
+      </Box>
     </Box>
   );
 }
 
-function Footer({ m }: { m: TuiModel }): React.ReactElement {
-  const width = termWidth();
-  const elapsed = humanDuration(Date.now() - m.startTs);
-  const doneCount = m.stages.filter((s) => s.status === "done").length;
+function AgentTree({ tree, height }: { tree: TreeNode[]; height: number }): React.ReactElement {
+  return (
+    <Box flexDirection="column" height={height} paddingX={1}>
+      <Text>
+        {nodeGlyph(orchestratorStatus(tree))} <Text bold>orchestrator</Text>
+      </Text>
+      {tree.map((n, i) => {
+        const connector = i === tree.length - 1 ? "└" : "├";
+        const running = n.status === "running";
+        return (
+          <Text key={n.name}>
+            <Text dimColor> {connector} </Text>
+            {nodeGlyph(n.status)} <Text dimColor={n.status === "pending"} bold={running}>
+              {n.name}
+            </Text>
+          </Text>
+        );
+      })}
+    </Box>
+  );
+}
+
+function UsageBox({ m }: { m: TuiModel }): React.ReactElement {
   const cost = formatCostUsd(estimateCostUsd(m.totalTokens, m.model));
-  const parts = [
-    `⏱ ${elapsed}`,
-    `stage ${doneCount}/${m.stages.length}`,
-    `${humanTokens(m.totalTokens)} tok ~${cost}`,
-  ];
   return (
-    <Box flexDirection="column" marginTop={1}>
-      <Text dimColor>{"─".repeat(Math.min(width, 60))}</Text>
-      <Text dimColor>{parts.join("   ")}</Text>
-      {m.workspacePath ? <Text dimColor>{truncate(m.workspacePath, width)}</Text> : null}
-    </Box>
-  );
-}
-
-function Checkpoint({ m }: { m: TuiModel }): React.ReactElement | null {
-  if (!m.checkpoint) return null;
-  return (
-    <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor="yellow" paddingX={1}>
-      <Text color="yellow" bold>
-        ⏸ checkpoint after {m.checkpoint.stage}
-      </Text>
-      <Text dimColor>inspect: {m.checkpoint.artifactPaths.join(", ")}</Text>
-      <Text>
-        <Text bold>[c]</Text> continue{"   "}
-        <Text bold>[r]</Text> retry stage{"   "}
-        <Text bold>[q]</Text> quit
+    <Box flexDirection="column" borderStyle="round" borderColor={theme.accent} paddingX={1}>
+      <Text color={theme.accent}>{m.model || "—"}</Text>
+      <Text>{tokensBig(m.totalTokens)} tokens</Text>
+      <Text dimColor>
+        ~{cost} · v{m.version}
       </Text>
     </Box>
   );
 }
 
-function ErrorNote({ m }: { m: TuiModel }): React.ReactElement | null {
-  if (!m.errorStage) return null;
+function StatusBar({ m }: { m: TuiModel }): React.ReactElement {
+  if (m.checkpoint) {
+    return (
+      <Box>
+        <Text>
+          <Text color={theme.accent} bold>
+            [c]
+          </Text>{" "}
+          continue{"  "}
+          <Text bold>[r]</Text> retry{"  "}
+          <Text bold>[q]</Text> quit
+        </Text>
+        <Text dimColor>
+          {"  ·  inspect: "}
+          {m.checkpoint.artifactPaths.map(shortPath).join(", ")}
+        </Text>
+      </Box>
+    );
+  }
   return (
-    <Box flexDirection="column" marginTop={1}>
-      <Text color="red" bold>
-        ✗ {m.errorStage} failed
-      </Text>
-      <Text dimColor>{truncate(m.errorText ?? "", termWidth())}</Text>
-      <Text dimColor>re-spawning the agent with the failure context…</Text>
+    <Box justifyContent="space-between">
+      <Text dimColor>···· esc stop</Text>
+      <Text dimColor>ctrl-q quit</Text>
     </Box>
   );
 }
+
+function InputArea({
+  value,
+  onChange,
+  onSubmit,
+  active,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  onSubmit: (v: string) => void;
+  active: boolean;
+}): React.ReactElement {
+  return (
+    <Box borderStyle="round" borderColor="green" paddingX={1}>
+      <Text color="green">{"> "}</Text>
+      <TextInput value={value} onChange={onChange} onSubmit={onSubmit} focus={active} placeholder="" />
+    </Box>
+  );
+}
+
+// --- dashboard ------------------------------------------------------------
 
 export function Dashboard({ store }: { store: Store }): React.ReactElement {
   const [, setTick] = useState(0);
+  const [scrollOffset, setScrollOffset] = useState(0);
+  const [input, setInput] = useState("");
+
   useEffect(() => {
-    const id = setInterval(() => setTick((t) => (t + 1) % 1_000_000), 100);
+    const id = setInterval(() => {
+      // Leave the splash after ~1s or once real content has arrived.
+      if (store.model.phase === "splash") {
+        const elapsed = Date.now() - store.model.startTs;
+        if (elapsed > 1000 || store.model.blocks.length > 0) store.model = enterMain(store.model);
+      }
+      setTick((t) => (t + 1) % 1_000_000);
+    }, 100);
     return () => clearInterval(id);
-  }, []);
+  }, [store]);
 
   const m = store.model;
+  const { cols, rows } = termSize();
+  const topHeight = Math.max(6, rows - INPUT_HEIGHT - STATUS_HEIGHT - 1);
+  const leftWidth = Math.max(20, cols - SIDEBAR_WIDTH - 1);
+  const contentWidth = Math.max(10, leftWidth - 2);
+  const lines = transcriptLines(m.blocks, contentWidth, theme.accent);
 
-  useInput((input, key) => {
-    if (!m.checkpoint || !store.checkpointResolver) return;
-    let decision: CheckpointDecision | null = null;
-    if (input === "r") decision = "retry";
-    else if (input === "q" || (key.ctrl && input === "c")) decision = "quit";
-    else if (input === "c" || key.return) decision = "continue";
-    if (!decision) return;
-    const resolve = store.checkpointResolver;
-    store.checkpointResolver = null;
-    store.model = clearCheckpoint(store.model);
-    resolve(decision);
+  useInput((inputChar, key) => {
+    // Checkpoint: single-key decisions, input box disabled.
+    if (m.checkpoint && store.checkpointResolver) {
+      let decision: CheckpointDecision | null = null;
+      if (inputChar === "r") decision = "retry";
+      else if (inputChar === "q") decision = "quit";
+      else if (inputChar === "c") decision = "continue";
+      if (decision) {
+        const resolve = store.checkpointResolver;
+        store.checkpointResolver = null;
+        store.model = clearCheckpoint(store.model);
+        resolve(decision);
+      }
+      return;
+    }
+    if (key.ctrl && inputChar === "q") {
+      store.onQuit?.();
+      return;
+    }
+    if (key.pageUp) setScrollOffset((o) => o + Math.max(1, topHeight - 1));
+    else if (key.pageDown) setScrollOffset((o) => Math.max(0, o - Math.max(1, topHeight - 1)));
+    else if (key.escape) setScrollOffset(0);
   });
 
+  if (m.phase === "splash") return <Splash m={m} />;
+
+  const inputActive = !m.checkpoint;
   return (
-    <Box flexDirection="column">
-      <Header m={m} />
-      <Box flexDirection="column">
-        {m.stages.map((s) => (
-          <StageRow key={s.name} stage={s} />
-        ))}
+    <Box flexDirection="column" width={cols} height={rows}>
+      <Box flexDirection="row" height={topHeight}>
+        <Box flexDirection="column" width={leftWidth} paddingX={1}>
+          <Transcript lines={lines} height={topHeight} width={leftWidth} scrollOffset={scrollOffset} />
+        </Box>
+        <Box flexDirection="column" width={SIDEBAR_WIDTH} height={topHeight}>
+          <Box flexGrow={1}>
+            <AgentTree tree={m.tree} height={topHeight - 6} />
+          </Box>
+          <UsageBox m={m} />
+        </Box>
       </Box>
-      <Active m={m} />
-      <ErrorNote m={m} />
-      <Checkpoint m={m} />
-      <Footer m={m} />
+      <StatusBar m={m} />
+      <InputArea
+        value={input}
+        onChange={setInput}
+        active={inputActive}
+        onSubmit={(v) => {
+          const text = v.trim();
+          if (text) {
+            store.steers.push(text);
+            store.model = applyEvent(store.model, { type: "agent:token", stage: m.tree.find((n) => n.status === "running")?.name ?? "orchestrator", text: `» you: ${text}`, ts: Date.now() });
+          }
+          setInput("");
+        }}
+      />
     </Box>
   );
 }
 
-/**
- * Mounts the Ink dashboard and wires it to the bus. Returns the Renderer
- * contract (awaitCheckpoint + stop) shared with the plain renderer.
- */
 export function attachTuiRenderer(bus: EventBus, _opts: { model?: string } = {}): Renderer {
   const store: Store = {
-    model: initModel(STAGES_TO_SHOW, Date.now()),
+    model: initModel(packageVersion(), Date.now()),
     checkpointResolver: null,
+    steers: [],
+    onQuit: null,
   };
 
   const unsubscribe = bus.on((e) => {
     store.model = applyEvent(store.model, e);
+    if (store.model.phase === "splash" && (e.type === "stage:start" || e.type === "stage:progress")) {
+      store.model = enterMain(store.model);
+    }
   });
 
-  let instance: Instance | null = null;
-  // A failure to mount Ink must fall back to plain, not crash the run.
-  instance = render(<Dashboard store={store} />, { exitOnCtrlC: false });
+  let instance: Instance | null = render(<Dashboard store={store} />, { exitOnCtrlC: false });
+  store.onQuit = () => {
+    if (instance) instance.unmount();
+  };
 
   return {
     awaitCheckpoint(stage: string, artifactPaths: string[]): Promise<CheckpointDecision> {
@@ -212,6 +325,11 @@ export function attachTuiRenderer(bus: EventBus, _opts: { model?: string } = {})
         store.model = { ...store.model, checkpoint: { stage, artifactPaths } };
         store.checkpointResolver = resolve;
       });
+    },
+    drainSteers(): string[] {
+      const out = store.steers.slice();
+      store.steers.length = 0;
+      return out;
     },
     stop() {
       unsubscribe();

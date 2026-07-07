@@ -8,13 +8,22 @@
  * working through the plain renderer.
  */
 
+/** One item in an agent's plan/todo checklist (sourced from plan.json). */
+export interface TodoItem {
+  text: string;
+  done: boolean;
+}
+
 export type PipelineEvent =
   | { type: "run:start"; runId: string; request: string; stack: string; model: string }
   | { type: "stage:start"; stage: string; agent: string }
   | { type: "stage:progress"; stage: string; tool: string; summary: string }
   | { type: "agent:token"; stage: string; text: string }
+  | { type: "agent:thinking"; stage: string; text: string }
+  | { type: "agent:todo"; stage: string; items: TodoItem[] }
   | { type: "stage:gate"; stage: string; passed: boolean; detail: string }
   | { type: "stage:done"; stage: string; durationMs: number; artifacts: string[]; tokens?: number }
+  | { type: "usage"; model: string; promptTokens: number; completionTokens: number; totalTokens: number }
   | { type: "checkpoint:await"; stage: string; artifactPaths: string[] }
   | { type: "run:done"; runId: string; workspacePath: string; summary: string; repoUrl?: string }
   | { type: "run:error"; stage: string; error: string };

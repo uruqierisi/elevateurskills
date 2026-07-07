@@ -109,6 +109,7 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
         artifacts: artifactPathsFor(state, stageName),
         tokens: usage.totalTokens,
       });
+      emitTodo(bus, state, [...completed, stageName]);
 
       if (opts.stopAfter && stageName === opts.stopAfter) {
         completed.push(stageName);
@@ -137,6 +138,47 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
     summary: `${completed.length} stage(s) completed: ${completed.join(", ")}`,
   });
   return { state, completed, aborted: false };
+}
+
+interface PlanTask {
+  title?: string;
+  area?: string;
+}
+
+/** Maps a plan task's `area` to the pipeline stage that owns it. */
+function areaToStage(area?: string): string | undefined {
+  switch ((area ?? "").toLowerCase()) {
+    case "backend":
+      return "backend";
+    case "frontend":
+      return "frontend";
+    case "infra":
+      return "devops";
+    default:
+      return undefined; // shared/unknown: not auto-completed
+  }
+}
+
+/**
+ * Emits the plan checklist as an agent:todo event, marking a task done when the
+ * pipeline stage that owns its area has completed. Derived purely from
+ * plan.json — the UI never reaches into planner internals.
+ */
+function emitTodo(bus: EventBus, state: RunState, completed: string[]): void {
+  if (!state.hasArtifact("plan.json")) return;
+  let plan: { tasks?: PlanTask[] };
+  try {
+    plan = state.readArtifact("plan.json");
+  } catch {
+    return;
+  }
+  const tasks = Array.isArray(plan.tasks) ? plan.tasks : [];
+  if (tasks.length === 0) return;
+  const items = tasks.map((t) => {
+    const stage = areaToStage(t.area);
+    return { text: t.title ?? "task", done: stage ? completed.includes(stage) : false };
+  });
+  bus.emit({ type: "agent:todo", stage: "planner", items });
 }
 
 /** The inspectable artifacts a stage produced (absolute paths). */
@@ -190,7 +232,13 @@ async function runStageWithRetries(
         // Structured, truncatable event to the bus for live rendering.
         if (e.type === "assistant" && e.text) {
           bus.emit({ type: "agent:token", stage: def.name, text: e.text });
-        } else if (e.type === "tool_call" || e.type === "tool_result") {
+        } else if (e.type === "thinking" && e.text) {
+          bus.emit({ type: "agent:thinking", stage: def.name, text: e.text });
+        } else if (e.type === "usage" && e.usage) {
+          bus.emit({ type: "usage", model: e.model ?? "", ...e.usage });
+        } else if (e.type === "tool_call") {
+          // Only the call becomes a transcript line (⚙ tool args); the result
+          // still goes to the disk log above, keeping the feed uncluttered.
           bus.emit({ type: "stage:progress", stage: def.name, tool: e.toolName ?? "tool", summary: e.text });
         } else if (e.type === "error") {
           bus.emit({ type: "stage:progress", stage: def.name, tool: e.toolName ?? "error", summary: e.text });

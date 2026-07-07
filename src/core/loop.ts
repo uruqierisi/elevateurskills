@@ -9,9 +9,13 @@ import { toolSchemas, type Tool, type ToolContext } from "./tools/index.js";
  */
 
 export interface AgentEvent {
-  type: "assistant" | "tool_call" | "tool_result" | "error";
+  type: "assistant" | "tool_call" | "tool_result" | "error" | "thinking" | "usage";
   text: string;
   toolName?: string;
+  /** Present on "usage" events. */
+  usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
+  /** Present on "usage" events: the concrete model id. */
+  model?: string;
 }
 
 export interface RunAgentOptions {
@@ -61,7 +65,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<AgentRunResult> {
       usage.promptTokens += res.usage.promptTokens;
       usage.completionTokens += res.usage.completionTokens;
       usage.totalTokens += res.usage.totalTokens;
+      // Emit per-call usage so the UI's usage box updates live after each call.
+      emit({ type: "usage", text: "", usage: res.usage, model: res.model });
     }
+
+    // Provider reasoning (when exposed) surfaces as a Thinking block.
+    if (res.reasoning && res.reasoning.trim()) emit({ type: "thinking", text: res.reasoning });
 
     const assistant = res.message;
     messages.push(assistant);

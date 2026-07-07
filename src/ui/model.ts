@@ -1,19 +1,33 @@
-import type { StampedEvent } from "../core/events.js";
+import type { StampedEvent, TodoItem } from "../core/events.js";
+import { PIPELINE } from "../core/agents.js";
+import { truncate } from "./format.js";
 
 /**
- * The TUI's view model and a pure reducer over pipeline events. Keeping this
- * separate from the Ink component means the "what to show" logic is testable
- * without a terminal: feed events, assert on the model. The component is then a
- * thin, dumb projection of this state.
+ * The TUI view model and a pure reducer over pipeline events. Keeping the
+ * "what to show" logic here (not in the Ink component) means the whole layout
+ * is testable without a terminal: feed events, assert on the model, and flatten
+ * the transcript to styled lines for the scroll viewport.
  */
 
-export type StageStatus = "pending" | "running" | "done" | "failed";
+export type NodeStatus = "pending" | "running" | "done" | "failed";
 
-export interface StageView {
+export interface TreeNode {
   name: string;
-  status: StageStatus;
-  durationMs?: number;
-  tokens?: number;
+  status: NodeStatus;
+}
+
+export type BlockKind = "text" | "thinking" | "todo" | "tool" | "gate" | "handoff";
+
+export interface TranscriptBlock {
+  id: number;
+  kind: BlockKind;
+  stage?: string;
+  text?: string;
+  tool?: string;
+  args?: string;
+  passed?: boolean;
+  detail?: string;
+  items?: TodoItem[];
 }
 
 export interface CheckpointView {
@@ -22,106 +36,116 @@ export interface CheckpointView {
 }
 
 export interface TuiModel {
+  phase: "splash" | "main";
   runId: string;
   request: string;
   stack: string;
   model: string;
+  version: string;
   startTs: number;
-  stages: StageView[];
-  activeStage?: string;
-  lastTool?: string;
-  /** Recent activity lines for the Active panel (raw; truncated at render). */
-  tail: string[];
+  blocks: TranscriptBlock[];
+  tree: TreeNode[];
   totalTokens: number;
+  checkpoint: CheckpointView | null;
   finished: boolean;
   aborted: boolean;
   errorStage?: string;
-  errorText?: string;
-  checkpoint: CheckpointView | null;
   workspacePath?: string;
+  nextId: number;
 }
 
-const TAIL_MAX = 8;
-const LINE_CAP = 240;
+const BLOCKS_MAX = 1000;
+const AGENTS = PIPELINE as string[];
 
-export function initModel(stageNames: string[], startTs: number): TuiModel {
+export function initModel(version: string, startTs: number): TuiModel {
   return {
+    phase: "splash",
     runId: "",
     request: "",
     stack: "",
     model: "",
+    version,
     startTs,
-    stages: stageNames.map((name) => ({ name, status: "pending" })),
-    tail: [],
+    blocks: [],
+    tree: AGENTS.map((name) => ({ name, status: "pending" })),
     totalTokens: 0,
+    checkpoint: null,
     finished: false,
     aborted: false,
-    checkpoint: null,
+    nextId: 1,
   };
 }
 
-function setStage(stages: StageView[], name: string, patch: Partial<StageView>): StageView[] {
-  return stages.map((s) => (s.name === name ? { ...s, ...patch } : s));
+function setNode(tree: TreeNode[], name: string, status: NodeStatus): TreeNode[] {
+  return tree.map((n) => (n.name === name ? { ...n, status } : n));
 }
 
-function pushTail(tail: string[], line: string): string[] {
-  const next = [...tail, line.slice(0, LINE_CAP)];
-  return next.length > TAIL_MAX ? next.slice(next.length - TAIL_MAX) : next;
+function push(m: TuiModel, block: Omit<TranscriptBlock, "id">): TuiModel {
+  const withId: TranscriptBlock = { ...block, id: m.nextId };
+  const blocks = [...m.blocks, withId];
+  return { ...m, blocks: blocks.length > BLOCKS_MAX ? blocks.slice(-BLOCKS_MAX) : blocks, nextId: m.nextId + 1 };
 }
 
 /** Pure reducer: returns a new model for the event (never mutates the input). */
 export function applyEvent(m: TuiModel, e: StampedEvent): TuiModel {
   switch (e.type) {
     case "run:start":
-      return { ...m, runId: e.runId, request: e.request, stack: e.stack, model: e.model };
-
-    case "stage:start":
       return {
         ...m,
-        stages: setStage(m.stages, e.stage, { status: "running" }),
-        activeStage: e.stage,
-        lastTool: undefined,
-        tail: [],
-        // A (re)start clears a prior recoverable error for this stage.
+        phase: "splash",
+        runId: e.runId,
+        request: e.request,
+        stack: e.stack,
+        model: e.model,
+      };
+
+    case "stage:start": {
+      const started = {
+        ...m,
+        tree: setNode(m.tree, e.stage, "running"),
         errorStage: m.errorStage === e.stage ? undefined : m.errorStage,
-        errorText: m.errorStage === e.stage ? undefined : m.errorText,
       };
+      // Only add a handoff divider when actually switching agents.
+      const last = m.blocks[m.blocks.length - 1];
+      if (last?.kind === "handoff" && last.stage === e.stage) return started;
+      return push(started, { kind: "handoff", stage: e.stage });
+    }
 
-    case "stage:progress":
-      return {
-        ...m,
-        lastTool: `${e.tool} ${e.summary}`,
-        tail: pushTail(m.tail, `${e.tool}: ${e.summary}`),
-      };
+    case "agent:thinking":
+      return push(m, { kind: "thinking", stage: e.stage, text: e.text });
 
     case "agent:token":
-      return { ...m, tail: pushTail(m.tail, `» ${e.text}`) };
+      return push(m, { kind: "text", stage: e.stage, text: e.text });
+
+    case "agent:todo": {
+      // Replace the existing plan block in place if present.
+      const idx = m.blocks.findIndex((b) => b.kind === "todo");
+      if (idx >= 0) {
+        const blocks = m.blocks.map((b, i) => (i === idx ? { ...b, items: e.items } : b));
+        return { ...m, blocks };
+      }
+      return push(m, { kind: "todo", stage: e.stage, items: e.items });
+    }
+
+    case "stage:progress":
+      return push(m, { kind: "tool", stage: e.stage, tool: e.tool, args: e.summary });
 
     case "stage:gate":
-      // Gate failure is not necessarily terminal (orchestrator retries); mark
-      // failed only transiently. run:error drives the hard-failed state.
-      return e.passed ? m : { ...m, tail: pushTail(m.tail, `gate failed: ${e.detail.split("\n")[0]}`) };
+      return push(m, { kind: "gate", stage: e.stage, passed: e.passed, detail: e.detail });
 
     case "stage:done":
-      return {
-        ...m,
-        stages: setStage(m.stages, e.stage, { status: "done", durationMs: e.durationMs, tokens: e.tokens }),
-        totalTokens: m.totalTokens + (e.tokens ?? 0),
-        activeStage: m.activeStage === e.stage ? undefined : m.activeStage,
-      };
+      return { ...m, tree: setNode(m.tree, e.stage, "done") };
+
+    case "usage":
+      return { ...m, totalTokens: m.totalTokens + e.totalTokens };
 
     case "checkpoint:await":
       return { ...m, checkpoint: { stage: e.stage, artifactPaths: e.artifactPaths } };
 
-    case "run:error":
-      return {
-        ...m,
-        stages: setStage(m.stages, e.stage, { status: "failed" }),
-        activeStage: undefined,
-        errorStage: e.stage,
-        errorText: e.error,
-        tail: pushTail(m.tail, `ERROR: ${e.error.split("\n")[0]}`),
-      };
+    case "run:error": {
+      const marked = { ...m, tree: setNode(m.tree, e.stage, "failed"), errorStage: e.stage };
+      return push(marked, { kind: "gate", stage: e.stage, passed: false, detail: e.error });
+    }
 
     case "run:done":
       return { ...m, finished: true, workspacePath: e.workspacePath };
@@ -134,4 +158,101 @@ export function applyEvent(m: TuiModel, e: StampedEvent): TuiModel {
 /** Clears a resolved checkpoint prompt. */
 export function clearCheckpoint(m: TuiModel): TuiModel {
   return { ...m, checkpoint: null };
+}
+
+/** Leave the splash and enter the main view. */
+export function enterMain(m: TuiModel): TuiModel {
+  return m.phase === "main" ? m : { ...m, phase: "main" };
+}
+
+/** Root orchestrator status derived from its children. */
+export function orchestratorStatus(tree: TreeNode[]): NodeStatus {
+  if (tree.some((n) => n.status === "failed")) return "failed";
+  if (tree.every((n) => n.status === "done")) return "done";
+  if (tree.some((n) => n.status === "running")) return "running";
+  return "pending";
+}
+
+// --- transcript flattening ------------------------------------------------
+
+export interface StyledLine {
+  text: string;
+  color?: string;
+  dim?: boolean;
+  italic?: boolean;
+  bold?: boolean;
+}
+
+/** Word-wrap a string to a width, returning at least one line. */
+function wrap(text: string, width: number): string[] {
+  const clean = text.replace(/\r/g, "");
+  const out: string[] = [];
+  for (const rawLine of clean.split("\n")) {
+    if (rawLine.length <= width) {
+      out.push(rawLine);
+      continue;
+    }
+    let rest = rawLine;
+    while (rest.length > width) {
+      // Prefer to break on the last space within width.
+      let cut = rest.lastIndexOf(" ", width);
+      if (cut <= 0) cut = width;
+      out.push(rest.slice(0, cut));
+      rest = rest.slice(cut).replace(/^\s+/, "");
+    }
+    if (rest.length) out.push(rest);
+  }
+  return out.length ? out : [""];
+}
+
+/**
+ * Flatten one transcript block into styled lines for the given content width.
+ * Pure and width-aware so the viewport can slice by rows.
+ */
+export function blockToLines(block: TranscriptBlock, width: number, accent: string): StyledLine[] {
+  const w = Math.max(10, width);
+  switch (block.kind) {
+    case "handoff": {
+      const label = ` ${block.stage ?? ""} `;
+      const dashes = Math.max(0, w - label.length - 2);
+      const left = "── ";
+      const right = "─".repeat(Math.max(0, dashes - left.length));
+      return [{ text: `${left}${block.stage ?? ""} ${right}`, color: accent, bold: true }];
+    }
+    case "thinking": {
+      const lines: StyledLine[] = [{ text: "🧠 Thinking", color: "magenta", bold: true }];
+      for (const l of wrap(block.text ?? "", w - 2)) lines.push({ text: `  ${l}`, dim: true, italic: true });
+      return lines;
+    }
+    case "todo": {
+      const lines: StyledLine[] = [{ text: "📋 Plan", color: accent, bold: true }];
+      for (const item of block.items ?? []) {
+        const box = item.done ? "[x]" : "[ ]";
+        lines.push({ text: `  ${box} ${truncate(item.text, w - 6)}`, dim: item.done });
+      }
+      return lines;
+    }
+    case "tool": {
+      const label = block.tool ?? "tool";
+      const args = block.args ? truncate(block.args, w - label.length - 4) : "";
+      return [{ text: `⚙ ${label}  ${args}`, color: accent }];
+    }
+    case "gate":
+      return block.passed
+        ? [{ text: `✓ ${block.stage} gate passed`, color: "green" }]
+        : [{ text: truncate(`✗ ${block.stage} gate failed: ${block.detail ?? ""}`, w), color: "red" }];
+    case "text":
+    default:
+      return wrap(block.text ?? "", w).map((l) => ({ text: l }));
+  }
+}
+
+/** Flatten all blocks to a single styled-line list. */
+export function transcriptLines(blocks: TranscriptBlock[], width: number, accent: string): StyledLine[] {
+  const out: StyledLine[] = [];
+  for (const b of blocks) {
+    for (const line of blockToLines(b, width, accent)) out.push(line);
+    if (b.kind === "thinking" || b.kind === "todo" || b.kind === "handoff") out.push({ text: "" });
+  }
+  return out;
 }
