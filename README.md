@@ -146,6 +146,30 @@ The **Architect's `architecture.json` is frozen**: backend and frontend both
 consume it and must not change it. That single locked contract is what lets the
 two sides be built independently without integration hell.
 
+### Adaptive pipeline (only the agents you need)
+
+The Architect classifies each request into a **profile** and records it in the
+frozen contract (`profile`, `requiredAgents`, `needsSandbox`, `needsDatabase`).
+The orchestrator then runs **only the required agents** — the rest are marked
+`skipped` (a dim `–` in the tree, never spawned, no gate, no tokens) — and the
+sandbox is activated **lazily**, only before the first stage that needs to run
+commands, and only when the profile needs it.
+
+| Profile | Runs | Backend | Sandbox/Docker |
+|---------|------|---------|----------------|
+| **static-site** | architect, frontend, reviewer | – | **no** (no-build HTML/CSS/JS) |
+| **frontend-app** | architect, frontend, qa, reviewer, devops | – | yes (build/tests) |
+| **api-only** | architect, backend, qa, reviewer, devops | ✓ | yes |
+| **fullstack** | all | ✓ | yes |
+
+So *"an informational website for a coffee shop"* classifies as **static-site**:
+the backend agent is skipped, **Docker is never started** (it runs even with no
+Docker installed), and the frontend gate just validates that the site's
+`index.html` renders — no build, no server boot. Override auto-classification
+with `--profile`, `--agents`, `--force-backend`, or `--no-backend`. The chosen
+profile and skipped agents are shown at the Architect checkpoint and in the
+final summary.
+
 An agent may not report success until its gate passes. On failure the
 orchestrator re-spawns it with the failure output as new context, up to
 `--max-attempts` times.
@@ -195,6 +219,10 @@ elevateurskills [options]
   --only <stages>          run only a subset, comma-separated
   --backend <mode>         sandbox: auto | docker | local (default: auto)
   --i-understand-local     consent to run model-generated commands on your host
+  --profile <id>           force profile: static-site | frontend-app | api-only | fullstack
+  --agents <list>          force an explicit agent set (architect always included)
+  --force-backend          pull the backend agent back in (implies sandbox + db)
+  --no-backend             drop the backend agent
   --max-attempts <n>       gate retries per stage (default: 2)
   --model <agent=spec>     per-agent model override (repeatable)
 ```
@@ -202,6 +230,13 @@ elevateurskills [options]
 Examples:
 
 ```bash
+# Adaptive: an informational site auto-classifies as static-site — the backend
+# agent is skipped and Docker never starts.
+elevateurskills --request "an informational website for a coffee shop"
+
+# Force a profile when you already know what you want
+elevateurskills --request "a landing page" --profile static-site
+
 # Inspect the frozen contract, then stop
 elevateurskills --request "a URL shortener" --stop-after architect
 
