@@ -11,7 +11,7 @@ import { PIPELINE } from "./core/agents.js";
 import { resolveModelId, checkKeysForModels } from "./core/llm.js";
 import { AGENT_MODEL_DEFAULTS } from "./core/models.js";
 import { EventBus } from "./core/events.js";
-import { resolveBackend, LOCAL_MODE_WARNING, ensureSandboxImage, SandboxInfraError } from "./core/sandbox.js";
+import { LOCAL_MODE_WARNING } from "./core/sandbox.js";
 import { attachRenderer } from "./ui/index.js";
 import type { StageName } from "./core/state.js";
 
@@ -87,32 +87,21 @@ async function main() {
   const keyError = checkKeysForModels(modelsInUse);
   if (keyError) fatal(keyError);
 
-  // Resolve the sandbox backend up front and announce it before any UI mounts.
-  let backend: "docker" | "local";
-  try {
-    backend = resolveBackend({ backend: opts.backend });
-  } catch (e) {
-    fatal(e instanceof Error ? e.message : String(e));
-  }
-  // Sandbox image is threaded into the orchestrator so the container runs the
-  // exact tag the preflight verified/built.
-  let sandboxImage: string | undefined;
-  if (backend === "docker") {
-    // Preflight BEFORE the planner runs: the daemon is reachable (resolveBackend
-    // already checked) and the image exists — build it if missing. Failing here
-    // costs zero tokens; failing at the backend gate wastes the whole planner +
-    // architect run.
-    try {
-      const { tag, built } = ensureSandboxImage((l) => console.log(chalk.dim(l)));
-      sandboxImage = tag;
-      console.log(chalk.dim(`[sandbox] docker ok · image ${tag} ${built ? "built" : "ready"}`));
-    } catch (e) {
-      if (e instanceof SandboxInfraError) fatal(`${e.message}\n${e.hint}`);
-      fatal(e instanceof Error ? e.message : String(e));
-    }
-  } else {
+  // The sandbox is now activated LAZILY inside the orchestrator — only if the
+  // classified profile needs command execution, and only before the first
+  // builder that runs. So we do NOT resolve Docker or build the image here: a
+  // static-site run must complete even with no Docker daemon. We only pass the
+  // backend intent and whether local execution is consented to.
+  const backendIntent = (opts.backend as "auto" | "docker" | "local") ?? "auto";
+  let localConsent = !!opts.iUnderstandLocal || existsSync(CONSENT_MARKER);
+  // For an explicitly-forced local backend, get consent up front (before any UI
+  // mounts) since we know host execution is intended. For auto/docker we stay
+  // non-interactive; if the run later needs local exec without consent, the
+  // orchestrator halts with a clear, resumable environment error.
+  if (backendIntent === "local" && !localConsent) {
     console.log(chalk.yellow(LOCAL_MODE_WARNING));
     await ensureLocalConsent(!!opts.auto, !!opts.iUnderstandLocal);
+    localConsent = true;
   }
 
   const bus = new EventBus();
@@ -129,7 +118,8 @@ async function main() {
       stopAfter: opts.stopAfter as StageName | undefined,
       only: only as StageName[] | undefined,
       maxAttempts: Number(opts.maxAttempts) || 2,
-      sandbox: { backend, image: sandboxImage },
+      sandbox: { backend: backendIntent },
+      localConsent,
       models,
       bus,
       control,

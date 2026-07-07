@@ -1,6 +1,14 @@
 import { join } from "node:path";
 import { runAgent } from "./loop.js";
-import { createSandbox, SandboxInfraError, type Sandbox, type SandboxOptions } from "./sandbox.js";
+import {
+  createSandbox,
+  resolveBackend,
+  ensureSandboxImage,
+  LocalSandbox,
+  SandboxInfraError,
+  type Sandbox,
+  type SandboxOptions,
+} from "./sandbox.js";
 import { RunState, type StageName } from "./state.js";
 import { AGENTS, PIPELINE, agentSystemPrompt, type AgentDef, type GateResult } from "./agents.js";
 import { scaffoldWorkspace } from "./scaffold.js";
@@ -33,6 +41,8 @@ export interface OrchestratorOptions {
   only?: StageName[];
   maxAttempts: number;
   sandbox?: SandboxOptions;
+  /** Operator consented to run model commands on the host (local sandbox exec). */
+  localConsent?: boolean;
   /** CLI overrides for the adaptive plan (--profile / --agents / backend toggles). */
   planOverrides?: PlanOverrides;
   models?: Record<string, string>;
@@ -69,6 +79,49 @@ function builderStages(): string[] {
   return (PIPELINE as string[]).filter((s) => AGENTS[s]?.mode === "builder");
 }
 
+/**
+ * Resolve and build the execution sandbox on demand. For Docker: resolve the
+ * daemon, build/verify the image (streamed to the transcript), and return a
+ * DockerSandbox. For local: require operator consent (host command execution).
+ * Any failure becomes an environment error (resumable), never a gate failure.
+ */
+function activateSandbox(
+  bus: EventBus,
+  state: RunState,
+  opts: OrchestratorOptions,
+  stageName: string,
+): { sandbox: Sandbox } | { infra: { message: string; hint: string } } {
+  const progress = (summary: string) => bus.emit({ type: "stage:progress", stage: stageName, tool: "sandbox", summary });
+  try {
+    const backend = resolveBackend({ backend: opts.sandbox?.backend });
+    if (backend === "docker") {
+      const { tag, built } = ensureSandboxImage(progress);
+      progress(`docker ok · image ${tag} ${built ? "built" : "ready"}`);
+      return { sandbox: createSandbox(state.workspaceDir, { backend: "docker", image: tag }) };
+    }
+    // Local execution runs model-generated commands on the host — require consent.
+    if (!opts.localConsent) {
+      const infra = {
+        message: "This run needs to run commands on the host (local sandbox), but consent was not given.",
+        hint: "Re-run with --i-understand-local, or install Docker and use --backend docker.",
+      };
+      bus.emit({ type: "env:error", stage: stageName, ...infra });
+      return { infra };
+    }
+    return { sandbox: createSandbox(state.workspaceDir, { backend: "local" }) };
+  } catch (err) {
+    // resolveBackend throws when --backend docker is forced but the daemon is
+    // down; ensureSandboxImage throws SandboxInfraError on a build failure.
+    const message = err instanceof Error ? err.message : String(err);
+    const hint =
+      err instanceof SandboxInfraError
+        ? err.hint
+        : "Install/start Docker, or use --backend local with --i-understand-local.";
+    bus.emit({ type: "env:error", stage: stageName, message, hint });
+    return { infra: { message, hint } };
+  }
+}
+
 /** Read architecture.json defensively (the gate already validated it). */
 function readArchSafe(state: RunState): unknown {
   try {
@@ -91,7 +144,14 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
     stack: opts.stack,
     id: opts.resumeId,
   });
-  const sandbox = createSandbox(state.workspaceDir, opts.sandbox);
+  // The sandbox is LAZY. Planner and Architect produce JSON and never execute
+  // commands, so we start with a Docker-free local sandbox (file writes stay
+  // confined to the workspace). The real execution sandbox — and, for Docker,
+  // the image build/preflight — is activated only before the first builder that
+  // actually runs, and only when the profile needs it. That is what lets a
+  // static site build with no Docker even when the daemon is absent.
+  let sandbox: Sandbox = new LocalSandbox(state.workspaceDir);
+  let sandboxActivated = false;
   const { provider, model } = resolveModelId();
   const modelStr = `${provider}/${model}`;
 
@@ -137,6 +197,19 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
       bus.emit({ type: "stage:done", stage: stageName, durationMs: 0, artifacts: artifactPathsFor(state, stageName) });
       completed.push(stageName);
       continue;
+    }
+
+    // Activate the execution sandbox lazily: only before the first builder that
+    // actually runs, and only when the profile needs command execution. Docker's
+    // image build/preflight happens here — never for planner/architect, and
+    // never at all for a no-build static site (needsSandbox === false).
+    if (plan?.needsSandbox && def.mode === "builder" && !sandboxActivated) {
+      const activated = activateSandbox(bus, state, opts, stageName);
+      if ("infra" in activated) {
+        return { state, completed, skipped: skippedStages, profile: plan?.profile, stoppedAt: stageName, aborted: true, infra: activated.infra };
+      }
+      sandbox = activated.sandbox;
+      sandboxActivated = true;
     }
 
     let decision: CheckpointDecision = "continue";
