@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { resolve } from "node:path";
 import { Command } from "commander";
 import chalk from "chalk";

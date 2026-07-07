@@ -45,14 +45,30 @@ That's the only thing you have to set. Everything else has a working default.
 ```bash
 npm install
 npm run build
-node dist/cli.js --request "a todo REST API"
+npm link          # makes `elevateurskills` a global command (dev)
+elevateurskills --request "a todo REST API"
 ```
 
-Or without building, straight from TypeScript:
+`node dist/cli.js --request "..."` also works and needs no link. Or run
+straight from TypeScript without building:
 
 ```bash
 npm run dev -- --request "a todo REST API"
 ```
+
+### Installing the command
+
+- **Local dev — `npm link`:** symlinks this repo onto your PATH, so
+  `elevateurskills` runs the code you're editing. Undo with `npm unlink -g
+  elevateurskills`.
+- **Use it like a normal tool — `npm install -g .`** (from the repo root):
+  installs a copy globally.
+- **Windows:** npm puts an `elevateurskills.cmd` (plus a `.ps1` and a bash
+  shim) on your PATH, so `elevateurskills` works in cmd, PowerShell, and Git
+  Bash alike — no extra setup.
+
+The command resolves its `.env`, `agents/`, and `runs/` relative to the
+package, so you can invoke it from any directory.
 
 On an interactive terminal you get a live dashboard (header, the pipeline with
 spinner/tick states and durations, the active agent's latest tool call and a

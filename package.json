@@ -5,10 +5,17 @@
   "type": "module",
   "license": "Apache-2.0",
   "bin": {
-    "elevateurskills": "dist/cli.js"
+    "elevateurskills": "./dist/cli.js"
   },
+  "files": [
+    "dist",
+    "agents",
+    "sandbox",
+    ".env.example"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "postbuild": "node scripts/postbuild.mjs",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
