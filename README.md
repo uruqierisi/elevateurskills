@@ -67,12 +67,17 @@ npm link          # makes `elevateurskills` a global command (dev)
 elevateurskills --request "a todo REST API"
 ```
 
-`node dist/cli.js --request "..."` also works and needs no link. Or run
-straight from TypeScript without building:
+`node dist/cli.js --request "..."` also works and needs no link.
 
-```bash
-npm run dev -- --request "a todo REST API"
-```
+> **Run the interactive TUI from the built CLI** (`elevateurskills` or `node
+> dist/cli.js`), not from `npm run dev`. `npm run dev` executes through **tsx**,
+> which prints its own runtime warnings to the terminal — and any stray write
+> while the TUI owns the screen bleeds into the frame and makes it jump. Use
+> `npm run dev` only for `--plain` output or non-TUI work:
+>
+> ```bash
+> npm run dev -- --request "a todo REST API" --plain
+> ```
 
 ### Installing the command
 
