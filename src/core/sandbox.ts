@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync } from "node:fs";
-import { isAbsolute, resolve, relative, sep } from "node:path";
+import { mkdirSync, existsSync, realpathSync } from "node:fs";
+import { isAbsolute, resolve, relative, sep, dirname } from "node:path";
 
 /**
  * Execution sandbox. All tool file/shell operations go through a Sandbox so
@@ -44,17 +44,60 @@ export interface Sandbox {
 const DEFAULT_TIMEOUT_MS = 180_000;
 const MAX_OUTPUT_CHARS = 200_000;
 
-/** Guards a relative path so it cannot escape the workspace root. */
-function safeResolve(root: string, relPath: string): string {
+function realpathOrSelf(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return resolve(p);
+  }
+}
+
+/** True if `p` is `root` or a descendant of it (both should be real paths). */
+function isWithin(root: string, p: string): boolean {
+  const rel = relative(root, p);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+/**
+ * Guards a relative path so it cannot escape the workspace root — including via
+ * symlinks. Three layers:
+ *   1. reject absolute inputs,
+ *   2. reject lexical `..` escapes,
+ *   3. resolve symlinks (realpath) on the nearest existing ancestor and, if the
+ *      target already exists, on the target itself, and require both to stay
+ *      inside the real workspace root.
+ * Layer 3 is what stops a symlink inside the workspace pointing at /etc from
+ * being written or read through.
+ */
+function confinePath(root: string, relPath: string): string {
   if (isAbsolute(relPath)) {
     throw new Error(`Absolute paths are not allowed inside the sandbox: ${relPath}`);
   }
   const abs = resolve(root, relPath);
   const rel = relative(root, abs);
-  if (rel === "" ) return abs;
-  if (rel.startsWith("..") || rel.split(sep)[0] === "..") {
+  if (rel !== "" && (rel.startsWith("..") || rel.split(sep)[0] === "..")) {
     throw new Error(`Path escapes the sandbox workspace: ${relPath}`);
   }
+
+  const realRoot = realpathOrSelf(root);
+
+  // Walk up to the nearest path that actually exists and realpath it. This
+  // catches a symlinked parent directory even when the target file is new.
+  let probe = abs;
+  while (!existsSync(probe)) {
+    const parent = dirname(probe);
+    if (parent === probe) break;
+    probe = parent;
+  }
+  if (!isWithin(realRoot, realpathOrSelf(probe))) {
+    throw new Error(`Path escapes the sandbox workspace via a symlink: ${relPath}`);
+  }
+
+  // If the target itself exists and is a symlink out, reject it too.
+  if (existsSync(abs) && !isWithin(realRoot, realpathOrSelf(abs))) {
+    throw new Error(`Path resolves outside the sandbox workspace via a symlink: ${relPath}`);
+  }
+
   return abs;
 }
 
@@ -72,7 +115,7 @@ export class LocalSandbox implements Sandbox {
   }
 
   resolve(relPath: string): string {
-    return safeResolve(this.root, relPath);
+    return confinePath(this.root, relPath);
   }
 
   exec(command: string, opts: ExecOptions = {}): Promise<ExecResult> {
@@ -123,7 +166,7 @@ export class DockerSandbox implements Sandbox {
   }
 
   resolve(relPath: string): string {
-    return safeResolve(this.root, relPath);
+    return confinePath(this.root, relPath);
   }
 
   exec(command: string, opts: ExecOptions = {}): Promise<ExecResult> {

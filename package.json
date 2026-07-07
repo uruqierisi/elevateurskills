@@ -21,7 +21,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "smoke:llm": "tsx scripts/smoke-llm.ts",
     "smoke:loop": "tsx scripts/smoke-loop.ts",
-    "smoke:tui": "tsx scripts/smoke-tui.tsx"
+    "smoke:tui": "tsx scripts/smoke-tui.tsx",
+    "smoke:sandbox": "tsx scripts/smoke-sandbox.ts"
   },
   "engines": {
     "node": ">=20"
