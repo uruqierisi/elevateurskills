@@ -7,6 +7,7 @@ import { orchestrate } from "./core/orchestrator.js";
 import { PIPELINE } from "./core/agents.js";
 import { resolveModelId } from "./core/llm.js";
 import { EventBus } from "./core/events.js";
+import { resolveBackend, LOCAL_MODE_WARNING } from "./core/sandbox.js";
 import { attachRenderer } from "./ui/index.js";
 import type { StageName } from "./core/state.js";
 
@@ -73,6 +74,19 @@ async function main() {
   const runsRoot = resolve(REPO_ROOT, opts.runsDir);
   const { provider, model } = resolveModelId();
 
+  // Resolve the sandbox backend up front and announce it before any UI mounts.
+  let backend: "docker" | "local";
+  try {
+    backend = resolveBackend({ backend: opts.backend });
+  } catch (e) {
+    fatal(e instanceof Error ? e.message : String(e));
+  }
+  if (backend === "docker") {
+    console.log(chalk.dim("[sandbox] Docker mode — commands run in an isolated container."));
+  } else {
+    console.log(chalk.yellow(LOCAL_MODE_WARNING));
+  }
+
   const bus = new EventBus();
   const control = { stopRequested: false };
   const renderer = attachRenderer(bus, { plain: !!opts.plain, model: `${provider}/${model}`, control });
@@ -87,7 +101,7 @@ async function main() {
       stopAfter: opts.stopAfter as StageName | undefined,
       only: only as StageName[] | undefined,
       maxAttempts: Number(opts.maxAttempts) || 2,
-      sandbox: { backend: opts.backend },
+      sandbox: { backend },
       models,
       bus,
       control,

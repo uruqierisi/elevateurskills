@@ -325,27 +325,39 @@ export interface SandboxOptions {
 
 const DEFAULT_IMAGE = "elevateurskills-sandbox";
 
+/** The honest local-mode warning shown at startup. */
+export const LOCAL_MODE_WARNING = [
+  "[sandbox] LOCAL mode — model-generated commands run on THIS machine.",
+  "Path writes are confined to the run workspace and a denylist blocks obvious",
+  "dangerous commands, but this is NOT real isolation. Use Docker (--backend docker)",
+  "for untrusted or unattended runs.",
+].join("\n");
+
 /**
- * Picks the sandbox backend. Docker is preferred for isolation; if it is not
- * installed we fall back to a local sandbox and warn loudly, because tool
- * commands then run on the host (confined to the workspace directory).
+ * Resolves the concrete backend without creating the sandbox, so callers can
+ * print the active-backend banner (and run the consent gate) before any UI
+ * mounts. `auto` picks Docker when the daemon is reachable, else local.
+ * Requesting `docker` explicitly with no daemon is an error.
+ */
+export function resolveBackend(options: SandboxOptions = {}): "docker" | "local" {
+  const backend = options.backend ?? "auto";
+  if (backend === "docker") {
+    if (!dockerAvailable()) {
+      throw new Error("Docker backend requested (--backend docker) but the docker daemon is not reachable.");
+    }
+    return "docker";
+  }
+  if (backend === "local") return "local";
+  return dockerAvailable() ? "docker" : "local";
+}
+
+/**
+ * Creates the sandbox for the resolved backend. Pass an explicit
+ * `backend: "docker" | "local"` (from resolveBackend) so this never re-decides.
  */
 export function createSandbox(root: string, options: SandboxOptions = {}): Sandbox {
-  const backend = options.backend ?? "auto";
-  const wantDocker = backend === "docker" || (backend === "auto" && dockerAvailable());
-
-  if (wantDocker) {
-    if (!dockerAvailable()) {
-      throw new Error("Docker backend requested but the docker CLI is not available.");
-    }
-    return new DockerSandbox(root, options.image ?? DEFAULT_IMAGE);
-  }
-
-  if (backend === "auto") {
-    console.warn(
-      "[sandbox] Docker not found — using LOCAL sandbox. Commands run on the host, " +
-        "confined to the run workspace. Install Docker for full isolation.",
-    );
-  }
-  return new LocalSandbox(root);
+  const backend = resolveBackend(options);
+  return backend === "docker"
+    ? new DockerSandbox(root, options.image ?? DEFAULT_IMAGE)
+    : new LocalSandbox(root);
 }
