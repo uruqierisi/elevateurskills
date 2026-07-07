@@ -212,9 +212,12 @@ export function buildLocalEnv(extra: Record<string, string> = {}): NodeJS.Proces
 export class LocalSandbox implements Sandbox {
   readonly kind = "local" as const;
   readonly root: string;
+  /** Env merged UNDER every command's own env (e.g. a default DATABASE_URL). */
+  private readonly defaultEnv: Record<string, string>;
 
-  constructor(root: string) {
+  constructor(root: string, defaultEnv: Record<string, string> = {}) {
     this.root = resolve(root);
+    this.defaultEnv = defaultEnv;
     mkdirSync(this.root, { recursive: true });
   }
 
@@ -229,8 +232,9 @@ export class LocalSandbox implements Sandbox {
       const child = spawn(command, {
         cwd,
         shell: true,
-        // Minimal, secret-free env — the host env is never inherited.
-        env: buildLocalEnv(opts.env),
+        // Minimal, secret-free env — the host env is never inherited. The
+        // per-command env wins over the sandbox default (e.g. DATABASE_URL).
+        env: buildLocalEnv({ ...this.defaultEnv, ...opts.env }),
       });
       let stdout = "";
       let stderr = "";
@@ -267,17 +271,29 @@ export interface DockerLimits {
 
 const DEFAULT_DOCKER_LIMITS: DockerLimits = { memory: "2g", cpus: "2", pids: "512" };
 
+export interface DockerSandboxOptions {
+  limits?: DockerLimits;
+  /** Docker network to attach each container to (for a Postgres sidecar). */
+  network?: string;
+  /** Env merged UNDER every command's own env (e.g. a default DATABASE_URL). */
+  defaultEnv?: Record<string, string>;
+}
+
 export class DockerSandbox implements Sandbox {
   readonly kind = "docker" as const;
   readonly root: string;
   private readonly image: string;
   private readonly limits: DockerLimits;
+  private readonly network?: string;
+  private readonly defaultEnv: Record<string, string>;
 
-  constructor(root: string, image: string, limits: DockerLimits = DEFAULT_DOCKER_LIMITS) {
+  constructor(root: string, image: string, options: DockerSandboxOptions = {}) {
     this.root = resolve(root);
     mkdirSync(this.root, { recursive: true });
     this.image = image;
-    this.limits = limits;
+    this.limits = options.limits ?? DEFAULT_DOCKER_LIMITS;
+    this.network = options.network;
+    this.defaultEnv = options.defaultEnv ?? {};
   }
 
   resolve(relPath: string): string {
@@ -294,11 +310,17 @@ export class DockerSandbox implements Sandbox {
    */
   buildRunArgs(command: string, opts: ExecOptions, containerName: string): string[] {
     const workdir = opts.cwd ? `/workspace/${opts.cwd.replace(/^\/+/, "")}` : "/workspace";
+    // Per-command env wins over the sandbox default (e.g. an explicit
+    // NODE_ENV=test overrides the injected DATABASE_URL flow).
+    const mergedEnv = { ...this.defaultEnv, ...(opts.env ?? {}) };
     const envArgs: string[] = [];
-    for (const [k, v] of Object.entries(opts.env ?? {})) {
+    for (const [k, v] of Object.entries(mergedEnv)) {
       if (isSecretName(k)) continue;
       envArgs.push("-e", `${k}=${v}`);
     }
+    // Attach to the run's user-defined network when a Postgres sidecar is up, so
+    // the container can reach it by container name via Docker's embedded DNS.
+    const networkArgs = this.network ? ["--network", this.network] : [];
     return [
       "run",
       "--rm",
@@ -314,6 +336,7 @@ export class DockerSandbox implements Sandbox {
       this.limits.cpus,
       "--pids-limit",
       this.limits.pids,
+      ...networkArgs,
       "-v",
       `${this.root}:/workspace`,
       "-w",
@@ -403,7 +426,20 @@ export interface SandboxOptions {
   /** Force a backend. Defaults to docker when available, else local. */
   backend?: "docker" | "local" | "auto";
   image?: string;
+  /** Docker network to attach containers to (for a Postgres sidecar). */
+  network?: string;
+  /** Env merged UNDER every command (e.g. a working DATABASE_URL for Prisma). */
+  defaultEnv?: Record<string, string>;
 }
+
+/**
+ * A syntactically-valid placeholder Postgres URL. Injected as the default
+ * DATABASE_URL when no live database sidecar is running, so `prisma
+ * generate`/`validate` (which only parse the schema and read env(), never
+ * connect) and the in-memory test path work without the agent having to invent
+ * a URL. The Docker backend replaces this with a real sidecar URL.
+ */
+export const DUMMY_DB_URL = "postgresql://postgres:postgres@localhost:5432/app";
 
 /**
  * The sandbox image is OUR image — it is built locally from sandbox/Dockerfile,
@@ -478,6 +514,99 @@ export function ensureSandboxImage(onLog: (line: string) => void = () => {}): En
 }
 
 /**
+ * A throwaway PostgreSQL sidecar for a single run. When the Docker backend runs
+ * the backend stage, the generated project's Prisma layer wants a real database
+ * to migrate against. We spin up `postgres:<tag>` on a dedicated user-defined
+ * network so the sandbox containers can reach it by name via Docker DNS, hand
+ * the sandbox a working DATABASE_URL, and tear both down when the run ends.
+ *
+ * Everything is best-effort and non-fatal: if Postgres can't start, the run
+ * still proceeds with the placeholder URL (the opinionated stack's repository
+ * pattern keeps tests runnable without a live DB), so a missing sidecar is a
+ * degraded state, never a hard failure.
+ */
+const POSTGRES_IMAGE = "postgres:16-alpine";
+
+export interface PostgresHandle {
+  /** Network the sandbox containers must join to reach Postgres. */
+  network: string;
+  /** DATABASE_URL pointing at the sidecar, reachable from sandbox containers. */
+  databaseUrl: string;
+}
+
+export class DockerPostgres {
+  readonly container: string;
+  readonly network: string;
+  private started = false;
+
+  constructor(runId: string) {
+    this.container = `eus-pg-${runId}`;
+    this.network = `eus-net-${runId}`;
+  }
+
+  /**
+   * Creates the network and starts Postgres, then polls pg_isready until the
+   * server accepts connections. Returns the handle on success, or null if the
+   * sidecar could not be brought up (the run continues with the placeholder).
+   */
+  start(onLog: (line: string) => void = () => {}): PostgresHandle | null {
+    const user = "postgres";
+    const password = "test";
+    const db = "test";
+    // Idempotent network create (ignore "already exists").
+    spawnSync("docker", ["network", "create", this.network], { timeout: 15_000, stdio: "ignore" });
+    onLog(`[sandbox] starting Postgres sidecar ${this.container} on ${this.network} …`);
+    const run = spawnSync(
+      "docker",
+      [
+        "run", "-d",
+        "--name", this.container,
+        "--network", this.network,
+        "-e", `POSTGRES_USER=${user}`,
+        "-e", `POSTGRES_PASSWORD=${password}`,
+        "-e", `POSTGRES_DB=${db}`,
+        POSTGRES_IMAGE,
+      ],
+      { encoding: "utf8", timeout: 5 * 60_000 },
+    );
+    if (run.error || run.status !== 0) {
+      onLog(`[sandbox] Postgres sidecar could not start (${firstLine(run.stderr ?? "") || run.error?.message || "unknown"}); continuing without a live DB.`);
+      this.stop();
+      return null;
+    }
+    this.started = true;
+
+    // Wait for readiness — up to ~40s — before letting the backend agent run.
+    const deadline = Date.now() + 40_000;
+    while (Date.now() < deadline) {
+      const ready = spawnSync("docker", ["exec", this.container, "pg_isready", "-U", user], {
+        timeout: 10_000,
+        stdio: "ignore",
+      });
+      if (ready.status === 0) {
+        onLog(`[sandbox] Postgres sidecar ready`);
+        // Host = container name, resolvable on the shared network.
+        const databaseUrl = `postgresql://${user}:${password}@${this.container}:5432/${db}`;
+        return { network: this.network, databaseUrl };
+      }
+      spawnSync("sleep", ["1"], { timeout: 2000 });
+    }
+    onLog(`[sandbox] Postgres sidecar did not become ready in time; continuing without a live DB.`);
+    this.stop();
+    return null;
+  }
+
+  /** Removes the container and network. Safe to call multiple times. */
+  stop(): void {
+    if (this.started) {
+      spawnSync("docker", ["rm", "-f", this.container], { timeout: 30_000, stdio: "ignore" });
+      this.started = false;
+    }
+    spawnSync("docker", ["network", "rm", this.network], { timeout: 15_000, stdio: "ignore" });
+  }
+}
+
+/**
  * Recognises Docker/daemon-level failures in a `docker run` result. Exit 125
  * means the daemon rejected the run (missing image, bad mount, daemon error) —
  * distinct from a non-zero exit of the *command inside* the container. The
@@ -522,10 +651,16 @@ export function resolveBackend(options: SandboxOptions = {}): "docker" | "local"
  */
 export function createSandbox(root: string, options: SandboxOptions = {}): Sandbox {
   const backend = resolveBackend(options);
+  // Every command gets a working DATABASE_URL so the agent never has to set one
+  // up: the sidecar's real URL when present, else the placeholder.
+  const defaultEnv = { DATABASE_URL: DUMMY_DB_URL, ...options.defaultEnv };
   // Default to the content-addressed tag the preflight built/verified, so the
   // container runs the exact image we ensured — never an untagged name that
   // `docker run` would try to pull.
   return backend === "docker"
-    ? new DockerSandbox(root, options.image ?? sandboxImageTag())
-    : new LocalSandbox(root);
+    ? new DockerSandbox(root, options.image ?? sandboxImageTag(), {
+        network: options.network,
+        defaultEnv,
+      })
+    : new LocalSandbox(root, defaultEnv);
 }

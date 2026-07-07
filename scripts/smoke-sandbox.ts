@@ -95,8 +95,11 @@ function main() {
 
   // --- docker run args hardening (no docker daemon needed) ---
   console.log("\n-- docker run args --");
-  const dsb = new DockerSandbox(join(tmpdir(), `eus-docker-${Date.now()}`), "elevateurskills-sandbox");
-  const dargs = dsb.buildRunArgs("npm install", { cwd: "backend", env: { DATABASE_URL: "postgresql://x", LLM_API_KEY: "sk-LEAK" } }, "eus-test");
+  const dsb = new DockerSandbox(join(tmpdir(), `eus-docker-${Date.now()}`), "elevateurskills-sandbox", {
+    network: "eus-net-r1",
+    defaultEnv: { DATABASE_URL: "postgresql://postgres:test@eus-pg-r1:5432/test" },
+  });
+  const dargs = dsb.buildRunArgs("npm install", { cwd: "backend", env: { NODE_ENV: "test", LLM_API_KEY: "sk-LEAK" } }, "eus-test");
   const joined = dargs.join(" ");
   const dchecks: Array<[string, boolean]> = [
     ["drops all capabilities", joined.includes("--cap-drop ALL")],
@@ -106,10 +109,18 @@ function main() {
     ["pids limit", joined.includes("--pids-limit 512")],
     ["mounts only the workspace", dargs.filter((a) => a === "-v").length === 1],
     ["never uses host network", !joined.includes("--network host")],
-    ["injects project DATABASE_URL", joined.includes("DATABASE_URL=postgresql://x")],
+    ["joins the sidecar network", joined.includes("--network eus-net-r1")],
+    ["injects sidecar DATABASE_URL default", joined.includes("DATABASE_URL=postgresql://postgres:test@eus-pg-r1:5432/test")],
+    ["injects per-command NODE_ENV", joined.includes("NODE_ENV=test")],
     ["never injects LLM_API_KEY", !joined.includes("LLM_API_KEY")],
     ["workdir is the mount", joined.includes("-w /workspace/backend")],
   ];
+  // Per-command env overrides the sandbox default.
+  const dsb2 = new DockerSandbox(join(tmpdir(), `eus-docker2-${Date.now()}`), "img", {
+    defaultEnv: { DATABASE_URL: "postgresql://default" },
+  });
+  const overrideArgs = dsb2.buildRunArgs("x", { env: { DATABASE_URL: "postgresql://override" } }, "eus-t2").join(" ");
+  dchecks.push(["per-command env wins over default", overrideArgs.includes("DATABASE_URL=postgresql://override") && !overrideArgs.includes("postgresql://default")]);
   for (const [label, pass] of dchecks) {
     console.log(`${pass ? "PASS" : "FAIL"}  ${label}`);
     if (!pass) ok = false;

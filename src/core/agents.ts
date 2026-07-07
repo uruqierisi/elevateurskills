@@ -159,16 +159,16 @@ function safeArch(state: RunState): Record<string, unknown> {
 
 // --- builder gates --------------------------------------------------------
 
-// A syntactically-valid placeholder URL. prisma generate/validate only parse
-// the schema and read env(); they never open a connection, so this is enough to
-// prove the schema and migrations are valid without a live database.
-const DUMMY_DB_URL = "postgresql://user:pass@localhost:5432/app";
-
+// prisma generate/validate only parse the schema and read env(); they never
+// open a connection. A working DATABASE_URL is already injected into every
+// sandbox command (the sidecar's real URL, or the placeholder — see
+// createSandbox), so the gate no longer has to supply one. The test step forces
+// NODE_ENV=test, which selects the in-memory repository per the backend role.
 const backendGate: Gate = (ctx) =>
   runSteps(ctx, "backend", [
     { label: "install", command: "npm install" },
-    { label: "prisma generate", command: "npx prisma generate", env: { DATABASE_URL: DUMMY_DB_URL } },
-    { label: "prisma validate", command: "npx prisma validate", env: { DATABASE_URL: DUMMY_DB_URL } },
+    { label: "prisma generate", command: "npx prisma generate" },
+    { label: "prisma validate", command: "npx prisma validate" },
     { label: "build", command: "npm run build" },
     { label: "test", command: "npm test", env: { NODE_ENV: "test" } },
   ]);
