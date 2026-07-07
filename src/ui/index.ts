@@ -13,6 +13,8 @@ export interface RendererOptions {
   model?: string;
   /** Shared stop flag the TUI toggles on ctrl-q / esc. */
   control?: RunControl;
+  /** Render a one-row layout-debug header (rows/chrome/transcript counts). */
+  debugLayout?: boolean;
 }
 
 /**
@@ -24,7 +26,7 @@ export function attachRenderer(bus: EventBus, opts: RendererOptions = {}): Rende
   const useTui = !opts.plain && Boolean(process.stdout.isTTY);
   if (useTui) {
     try {
-      return attachTuiRenderer(bus, { model: opts.model, control: opts.control });
+      return attachTuiRenderer(bus, { model: opts.model, control: opts.control, debugLayout: opts.debugLayout });
     } catch {
       // Ink failed to mount — degrade to the always-works plain renderer.
     }

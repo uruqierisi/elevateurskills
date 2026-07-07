@@ -56,6 +56,8 @@ interface Store {
   steers: string[];
   control: RunControl | null;
   onQuit: (() => void) | null;
+  /** When true, render a one-row layout-debug header (rows/chrome/transcript). */
+  debugLayout: boolean;
 }
 
 // --- small helpers --------------------------------------------------------
@@ -69,9 +71,22 @@ function tokensBig(n: number): string {
   return String(n);
 }
 
-function shortPath(p: string): string {
-  const idx = p.replace(/\\/g, "/").indexOf("/runs/");
-  return idx >= 0 ? p.slice(idx + 1) : p;
+/** Basename of a path (the file/dir a checkpoint points at). */
+function baseName(p: string): string {
+  const parts = p.replace(/\\/g, "/").replace(/\/+$/, "").split("/");
+  return parts[parts.length - 1] || p;
+}
+
+/**
+ * Hard-clip a string to a single row of `width` columns (ellipsis if cut). Every
+ * single-line chrome element passes through this so it can NEVER wrap to a second
+ * row — an uncounted wrapped row is what pushes the layout past the terminal
+ * height and makes the border jitter.
+ */
+function clip1(s: string, width: number): string {
+  const w = Math.max(1, width);
+  const flat = s.replace(/\s+/g, " ");
+  return flat.length <= w ? flat : flat.slice(0, Math.max(0, w - 1)) + "…";
 }
 
 function nodeGlyph(status: NodeStatus, frame: string): React.ReactElement {
@@ -218,30 +233,26 @@ function UsageBox({ m }: { m: TuiModel }): React.ReactElement {
   );
 }
 
-function StatusBar({ m }: { m: TuiModel }): React.ReactElement {
+/**
+ * Exactly one row, always. Renders a single truncated Text so it can never wrap
+ * — the checkpoint bar in particular used to wrap to two rows and tip the whole
+ * column past `rows`, which is what made the border jitter worse at a checkpoint.
+ */
+function StatusBar({ m, cols }: { m: TuiModel; cols: number }): React.ReactElement {
   if (m.checkpoint) {
+    const targets = m.checkpoint.artifactPaths.map(baseName).join(", ");
+    const text = `[c]ontinue [r]etry [q]uit · ${targets}`;
     return (
-      <Box>
-        <Text>
-          <Text color={theme.accent} bold>
-            [c]
-          </Text>{" "}
-          continue{"  "}
-          <Text bold>[r]</Text> retry{"  "}
-          <Text bold>[q]</Text> quit
-        </Text>
-        <Text dimColor>
-          {"  ·  inspect: "}
-          {m.checkpoint.artifactPaths.map(shortPath).join(", ")}
-        </Text>
-      </Box>
+      <Text color={theme.accent} wrap="truncate-end">
+        {clip1(text, cols)}
+      </Text>
     );
   }
+  const text = "PgUp/PgDn scroll · Home/End top/bottom · esc stop · ctrl-q quit";
   return (
-    <Box justifyContent="space-between">
-      <Text dimColor>PgUp/PgDn scroll · Home/End top/bottom · esc stop</Text>
-      <Text dimColor>ctrl-q quit</Text>
-    </Box>
+    <Text dimColor wrap="truncate-end">
+      {clip1(text, cols)}
+    </Text>
   );
 }
 
@@ -301,13 +312,14 @@ export function Dashboard({ store }: { store: Store }): React.ReactElement {
   const { cols, rows } = termSize();
   const frame = spinnerFrame(tick);
 
-  // Height budget: the transcript region is the ONLY flexible area. Everything
-  // else has a fixed row cost, and the confirm modal (when shown) is reserved
-  // out of the transcript height so the column total never exceeds `rows` — an
-  // over-tall column is what makes the terminal scroll and the bottom border
-  // jitter on redraw.
-  const reserved = STATUS_HEIGHT + INPUT_HEIGHT + (store.confirmReq ? CONFIRM_HEIGHT : 0);
-  const topHeight = Math.max(3, rows - reserved);
+  // Height budget: the transcript region is the ONLY flexible area. Every other
+  // element is a KNOWN fixed row count and is truncated so it can never wrap.
+  // `chrome` is the sum of those fixed rows (recomputed as the confirm/debug rows
+  // toggle); `topHeight = rows - chrome`, so transcript + chrome == rows exactly.
+  // Anything that pushed the total past `rows` is what made the border jitter.
+  const debugRows = store.debugLayout ? 1 : 0;
+  const chrome = debugRows + STATUS_HEIGHT + INPUT_HEIGHT + (store.confirmReq ? CONFIRM_HEIGHT : 0);
+  const topHeight = Math.max(1, rows - chrome);
   const leftWidth = Math.max(20, cols - SIDEBAR_WIDTH - 1);
   const contentWidth = Math.max(10, leftWidth - 2);
   const lines = transcriptLines(m.blocks, contentWidth, theme.accent);
@@ -384,8 +396,18 @@ export function Dashboard({ store }: { store: Store }): React.ReactElement {
   if (m.phase === "splash") return <Splash m={m} frame={frame} />;
 
   const inputActive = !m.checkpoint && !store.confirmReq;
+  // The rendered line total: header + transcript rows + confirm + status + input.
+  // This MUST equal rows; --debug-layout surfaces the numbers to confirm it.
+  const renderedRows = chrome + topHeight;
   return (
     <Box flexDirection="column" width={cols} height={rows} overflow="hidden">
+      {store.debugLayout ? (
+        <Box height={debugRows} flexShrink={0}>
+          <Text color="yellow" wrap="truncate-end">
+            {clip1(`layout rows=${rows} chrome=${chrome} transcript=${topHeight} rendered=${renderedRows} lines=${lines.length}`, cols)}
+          </Text>
+        </Box>
+      ) : null}
       <Box flexDirection="row" height={topHeight} overflow="hidden">
         <Box flexDirection="column" width={leftWidth} height={topHeight} paddingX={1} overflow="hidden">
           <Transcript vp={vp} width={contentWidth} />
@@ -399,16 +421,16 @@ export function Dashboard({ store }: { store: Store }): React.ReactElement {
       </Box>
       {store.confirmReq ? (
         <Box flexDirection="column" height={CONFIRM_HEIGHT} flexShrink={0} borderStyle="round" borderColor="yellow" paddingX={1}>
-          <Text color="yellow" bold>
-            {store.confirmReq.question}
+          <Text color="yellow" bold wrap="truncate-end">
+            {clip1(store.confirmReq.question, Math.max(1, cols - 4))}
           </Text>
-          <Text>
+          <Text wrap="truncate-end">
             <Text bold>[y]</Text> run   <Text bold>[n]</Text> refuse
           </Text>
         </Box>
       ) : null}
       <Box height={STATUS_HEIGHT} flexShrink={0}>
-        <StatusBar m={m} />
+        <StatusBar m={m} cols={cols} />
       </Box>
       <Box height={INPUT_HEIGHT} flexShrink={0}>
         <InputArea
@@ -453,7 +475,7 @@ function guardConsole(): () => void {
   };
 }
 
-export function attachTuiRenderer(bus: EventBus, opts: { model?: string; control?: RunControl } = {}): Renderer {
+export function attachTuiRenderer(bus: EventBus, opts: { model?: string; control?: RunControl; debugLayout?: boolean } = {}): Renderer {
   const store: Store = {
     model: initModel(packageVersion(), Date.now()),
     checkpointResolver: null,
@@ -461,6 +483,7 @@ export function attachTuiRenderer(bus: EventBus, opts: { model?: string; control
     steers: [],
     control: opts.control ?? null,
     onQuit: null,
+    debugLayout: opts.debugLayout ?? false,
   };
 
   const unsubscribe = bus.on((e) => {

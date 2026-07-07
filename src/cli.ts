@@ -38,6 +38,7 @@ async function main() {
     .option("-s, --stack <name>", "target stack", "node-prisma-react")
     .option("--auto", "skip inter-stage checkpoints (autonomous)", false)
     .option("--plain", "force the plain line renderer (no TUI)", false)
+    .option("--debug-layout", "TUI: show a one-row header with height-budget numbers", false)
     .option("--i-understand-local", "consent to run model-generated commands on your host (local sandbox)", false)
     .option("--resume <run-id>", "resume an existing run")
     .option("--stop-after <stage>", "stop after this stage")
@@ -116,7 +117,7 @@ async function main() {
 
   const bus = new EventBus();
   const control = { stopRequested: false };
-  const renderer = attachRenderer(bus, { plain: !!opts.plain, model: `${provider}/${model}`, control });
+  const renderer = attachRenderer(bus, { plain: !!opts.plain, model: `${provider}/${model}`, control, debugLayout: !!opts.debugLayout });
 
   try {
     const result = await orchestrate({
