@@ -287,7 +287,10 @@ const devopsGate: Gate = async ({ sandbox }) => {
 // --- task builders --------------------------------------------------------
 
 function contractContext(state: RunState): string {
-  return `Target stack: ${state.manifest.stack}\nRequest: ${state.manifest.request}`;
+  return (
+    `Request: ${state.manifest.request}\n` +
+    `Default stack (applies to fullstack/api-only only; ignore it for a static site): ${state.manifest.stack}`
+  );
 }
 
 function frozenContractBlock(state: RunState): string {
@@ -321,7 +324,11 @@ export const AGENTS: Record<string, AgentDef> = {
     maxIterations: 4,
     buildTask: (state) => {
       const plan = state.readArtifactText("plan.json");
-      return `${contractContext(state)}\n\nThe plan.json is:\n\n\`\`\`json\n${plan}\n\`\`\`\n\nProduce the frozen architecture.json object. Output JSON only.`;
+      const forced = state.manifest.shared.forcedProfile as string | undefined;
+      const hint = forced
+        ? `\n\nThe operator has FORCED the profile to "${forced}". Set "profile": "${forced}" and emit a contract that matches it (agents/needs per that profile).`
+        : "";
+      return `${contractContext(state)}\n\nThe plan.json is:\n\n\`\`\`json\n${plan}\n\`\`\`${hint}\n\nProduce the frozen architecture.json object. Output JSON only.`;
     },
     gate: architectureGate,
   },

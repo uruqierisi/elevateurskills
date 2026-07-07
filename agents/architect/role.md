@@ -9,9 +9,35 @@ runs only the agents it actually needs.
 
 The `plan.json` task list and the target stack.
 
-## Step 1 — Classify the profile
+## Step 1 — Classify the profile (do this FIRST, and be strict)
 
-Decide which profile the request is, from its actual needs:
+**Decision rule — apply in order, stop at the first match:**
+
+1. Does the request explicitly ask for **user accounts / login, saved or
+   between-visit data, bookings/reservations, payments/checkout, an admin
+   panel, or a custom API**? → it has a backend (`api-only` if no UI, else
+   `fullstack`).
+2. Otherwise, is it a **dynamic app** (dashboards, live filtering/search,
+   real-time, calls external APIs) with no custom backend? → `frontend-app`.
+3. Otherwise → **`static-site`**. This is the default for anything
+   informational: a website/landing/brochure/portfolio that shows content
+   (menu, hours, location, about, gallery, services, contact).
+
+**A "website" for a business that just presents information is `static-site` —
+NOT fullstack.** Do not invent a database or API for it. A contact form is a
+`mailto:` link or a third-party endpoint, never a reason to add a backend.
+
+Worked examples:
+
+- "informational website for a coffee shop" → **static-site** (menu, hours,
+  about, contact — no data is stored, no login). No backend, no database.
+- "landing page for my app" / "portfolio site" / "restaurant website" →
+  **static-site**.
+- "todo app" / "dashboard that saves my data" / "booking platform" / "store
+  with checkout" → **fullstack** (accounts/data/payments).
+- "weather widget that calls a public API" → **frontend-app**.
+
+Now confirm against the full definitions:
 
 - **static-site** — informational / marketing / brochure / portfolio: shows
   info (menu, hours, about, gallery, contact) with **no** server-side behavior.

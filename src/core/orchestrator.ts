@@ -153,6 +153,9 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
   let sandbox: Sandbox = new LocalSandbox(state.workspaceDir);
   let sandboxActivated = false;
   let plan: ProjectPlan | null = null;
+  // A forced --profile is shared with the Architect so its contract matches the
+  // profile the operator chose (not just which agents run).
+  if (opts.planOverrides?.profile) state.stateAccess().write("forcedProfile", opts.planOverrides.profile);
   const { provider, model } = resolveModelId();
 
   // Resolve + announce the adaptive plan the moment the frozen contract exists.
