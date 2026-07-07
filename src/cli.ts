@@ -1,5 +1,8 @@
 #!/usr/bin/env node
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
+import { existsSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { createInterface } from "node:readline/promises";
 import { Command } from "commander";
 import chalk from "chalk";
 import { loadEnv, REPO_ROOT } from "./core/env.js";
@@ -34,6 +37,7 @@ async function main() {
     .option("-s, --stack <name>", "target stack", "node-prisma-react")
     .option("--auto", "skip inter-stage checkpoints (autonomous)", false)
     .option("--plain", "force the plain line renderer (no TUI)", false)
+    .option("--i-understand-local", "consent to run model-generated commands on your host (local sandbox)", false)
     .option("--resume <run-id>", "resume an existing run")
     .option("--stop-after <stage>", "stop after this stage")
     .option("--only <stages>", "comma-separated subset of stages to run")
@@ -85,6 +89,7 @@ async function main() {
     console.log(chalk.dim("[sandbox] Docker mode — commands run in an isolated container."));
   } else {
     console.log(chalk.yellow(LOCAL_MODE_WARNING));
+    await ensureLocalConsent(!!opts.auto, !!opts.iUnderstandLocal);
   }
 
   const bus = new EventBus();
@@ -132,6 +137,48 @@ function printFinalSummary(result: import("./core/orchestrator.js").Orchestrator
     ? chalk.red(`STOPPED${result.stoppedAt ? ` at ${result.stoppedAt}` : ""}`)
     : chalk.green(result.stoppedAt ? `stopped after ${result.stoppedAt}` : "complete");
   process.stdout.write(`${chalk.bold("status")}    ${status}\n`);
+}
+
+const CONSENT_MARKER = join(homedir(), ".elevateurskills-consent");
+
+/**
+ * Gate for the local sandbox: model-generated commands run on the host, so we
+ * require explicit acknowledgement — the first interactive run, and EVERY time
+ * --auto is combined with local. `--i-understand-local` grants it up front;
+ * --auto without that flag (or non-interactive without consent) is refused.
+ */
+async function ensureLocalConsent(auto: boolean, iUnderstand: boolean): Promise<void> {
+  if (iUnderstand) {
+    touchConsent();
+    return;
+  }
+  if (auto) {
+    fatal(
+      "refusing to run --auto with the LOCAL sandbox without consent.\n" +
+        "Local mode runs model-generated commands on your host. Re-run with --backend docker\n" +
+        "(isolated), or add --i-understand-local if you accept the risk.",
+    );
+  }
+  if (existsSync(CONSENT_MARKER)) return;
+  if (!process.stdin.isTTY) {
+    fatal(
+      "local sandbox needs consent but stdin is not interactive.\n" +
+        "Add --i-understand-local or use --backend docker.",
+    );
+  }
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const ans = (await rl.question(chalk.yellow("Type 'yes' to run model-generated commands on your host: "))).trim().toLowerCase();
+  rl.close();
+  if (ans !== "yes") fatal("aborted — no consent given for local mode.");
+  touchConsent();
+}
+
+function touchConsent(): void {
+  try {
+    writeFileSync(CONSENT_MARKER, new Date().toISOString() + "\n", "utf8");
+  } catch {
+    /* best effort — consent still granted for this run */
+  }
 }
 
 function fatal(msg: string): never {
