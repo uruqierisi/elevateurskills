@@ -37,8 +37,20 @@ export function attachPlainRenderer(bus: EventBus, opts: { model?: string } = {}
         model = e.model;
         line(e.ts, chalk.bold(`▶ run ${e.runId}`) + chalk.dim(` · ${e.request} · ${e.model} · ${e.stack}`));
         break;
+      case "run:plan":
+        line(
+          e.ts,
+          chalk.bold(`◆ profile: ${e.profile}`) +
+            chalk.dim(` · runs: ${e.requiredAgents.join(", ")}`) +
+            (e.skipped.length ? chalk.dim(` · skips: ${e.skipped.join(", ")}`) : "") +
+            chalk.dim(` · sandbox: ${e.needsSandbox ? "yes" : "no"}`),
+        );
+        break;
       case "stage:start":
         line(e.ts, chalk.cyan(`■ ${e.stage}`) + chalk.dim(" started"));
+        break;
+      case "stage:skipped":
+        line(e.ts, chalk.dim(`– ${e.stage} skipped (${e.reason})`));
         break;
       case "stage:progress":
         line(e.ts, chalk.dim(`  ${e.stage} `) + chalk.dim(`${e.tool}: ${e.summary}`));

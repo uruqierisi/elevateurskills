@@ -24,7 +24,7 @@ export type StageName =
   | "reviewer"
   | "devops";
 
-export type StageStatus = "pending" | "in_progress" | "done" | "failed";
+export type StageStatus = "pending" | "in_progress" | "done" | "failed" | "skipped";
 
 export interface StageRecord {
   status: StageStatus;

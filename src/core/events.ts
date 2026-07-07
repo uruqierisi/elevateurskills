@@ -16,7 +16,11 @@ export interface TodoItem {
 
 export type PipelineEvent =
   | { type: "run:start"; runId: string; request: string; stack: string; model: string }
+  // The adaptive plan, emitted once the Architect's contract is classified.
+  | { type: "run:plan"; profile: string; requiredAgents: string[]; skipped: string[]; needsSandbox: boolean }
   | { type: "stage:start"; stage: string; agent: string }
+  // A stage that will not run under the chosen profile — never spawned, no gate.
+  | { type: "stage:skipped"; stage: string; reason: string }
   | { type: "stage:progress"; stage: string; tool: string; summary: string }
   | { type: "agent:token"; stage: string; text: string }
   | { type: "agent:thinking"; stage: string; text: string }

@@ -9,7 +9,7 @@ import { truncate } from "./format.js";
  * the transcript to styled lines for the scroll viewport.
  */
 
-export type NodeStatus = "pending" | "running" | "done" | "failed";
+export type NodeStatus = "pending" | "running" | "done" | "failed" | "skipped";
 
 export interface TreeNode {
   name: string;
@@ -99,6 +99,13 @@ export function applyEvent(m: TuiModel, e: StampedEvent): TuiModel {
         model: e.model,
       };
 
+    case "run:plan":
+      // Mark every skipped agent up front so the tree shows the plan at a glance.
+      return {
+        ...m,
+        tree: e.skipped.reduce((tree, name) => setNode(tree, name, "skipped"), m.tree),
+      };
+
     case "stage:start": {
       const started = {
         ...m,
@@ -110,6 +117,12 @@ export function applyEvent(m: TuiModel, e: StampedEvent): TuiModel {
       if (last?.kind === "handoff" && last.stage === e.stage) return started;
       return push(started, { kind: "handoff", stage: e.stage });
     }
+
+    case "stage:skipped":
+      return push(
+        { ...m, tree: setNode(m.tree, e.stage, "skipped") },
+        { kind: "text", stage: e.stage, text: `– ${e.stage} skipped (${e.reason})` },
+      );
 
     case "agent:thinking":
       return push(m, { kind: "thinking", stage: e.stage, text: e.text });

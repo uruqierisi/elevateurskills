@@ -167,9 +167,14 @@ function printFinalSummary(result: import("./core/orchestrator.js").Orchestrator
   const recap = PIPELINE.filter((s) => result.completed.includes(s))
     .map((s) => `  ${chalk.green("✓")} ${s}`)
     .join("\n");
+  const skips = PIPELINE.filter((s) => result.skipped.includes(s))
+    .map((s) => `  ${chalk.dim("–")} ${chalk.dim(`${s} (skipped: ${result.profile ?? "profile"})`)}`)
+    .join("\n");
   process.stdout.write("\n" + chalk.dim("─".repeat(40)) + "\n");
   process.stdout.write(`${chalk.bold("run")}       ${result.state.manifest.id}\n`);
+  if (result.profile) process.stdout.write(`${chalk.bold("profile")}   ${result.profile}\n`);
   if (recap) process.stdout.write(`${chalk.bold("completed")}\n${recap}\n`);
+  if (skips) process.stdout.write(`${chalk.bold("skipped")}\n${skips}\n`);
   process.stdout.write(`${chalk.bold("workspace")} ${result.state.workspaceDir}\n`);
   const status = result.aborted
     ? chalk.red(`STOPPED${result.stoppedAt ? ` at ${result.stoppedAt}` : ""}`)

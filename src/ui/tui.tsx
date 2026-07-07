@@ -97,6 +97,8 @@ function nodeGlyph(status: NodeStatus, frame: string): React.ReactElement {
       return <Text color="green">✓</Text>;
     case "failed":
       return <Text color="red">✗</Text>;
+    case "skipped":
+      return <Text dimColor>–</Text>;
     default:
       return <Text dimColor>○</Text>;
   }
@@ -210,7 +212,7 @@ function AgentTree({ tree, height, frame }: { tree: TreeNode[]; height: number; 
         return (
           <Text key={n.name}>
             <Text dimColor> {connector} </Text>
-            {nodeGlyph(n.status, frame)} <Text dimColor={n.status === "pending"} bold={running}>
+            {nodeGlyph(n.status, frame)} <Text dimColor={n.status === "pending" || n.status === "skipped"} bold={running}>
               {n.name}
             </Text>
           </Text>

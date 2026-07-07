@@ -6,6 +6,7 @@ import { AGENTS, PIPELINE, agentSystemPrompt, type AgentDef, type GateResult } f
 import { scaffoldWorkspace } from "./scaffold.js";
 import { resolveModelId } from "./llm.js";
 import { AGENT_MODEL_DEFAULTS } from "./models.js";
+import { resolvePlan, type ProjectPlan, type PlanOverrides } from "./profile.js";
 import { EventBus, type CheckpointDecision } from "./events.js";
 import type { RunControl } from "./loop.js";
 import type { ToolContext } from "./tools/index.js";
@@ -32,6 +33,8 @@ export interface OrchestratorOptions {
   only?: StageName[];
   maxAttempts: number;
   sandbox?: SandboxOptions;
+  /** CLI overrides for the adaptive plan (--profile / --agents / backend toggles). */
+  planOverrides?: PlanOverrides;
   models?: Record<string, string>;
   /** Structured event sink. Renderers subscribe to this. */
   bus: EventBus;
@@ -51,10 +54,28 @@ export interface OrchestratorOptions {
 export interface OrchestratorResult {
   state: RunState;
   completed: string[];
+  /** Agents the chosen profile skipped (never spawned). */
+  skipped: string[];
+  /** The resolved profile, once the contract was classified. */
+  profile?: string;
   stoppedAt?: string;
   aborted: boolean;
   /** Set when the run halted on a sandbox/environment failure, not a gate. */
   infra?: { message: string; hint: string };
+}
+
+/** The builder-mode stages, in pipeline order (the ones a profile can skip). */
+function builderStages(): string[] {
+  return (PIPELINE as string[]).filter((s) => AGENTS[s]?.mode === "builder");
+}
+
+/** Read architecture.json defensively (the gate already validated it). */
+function readArchSafe(state: RunState): unknown {
+  try {
+    return state.readArtifact("architecture.json");
+  } catch {
+    return {};
+  }
 }
 
 interface Usage {
@@ -78,12 +99,34 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
 
   const scope = opts.only ?? (PIPELINE as StageName[]);
   const completed: string[] = [];
+  const skippedStages: string[] = [];
+  // The adaptive plan is resolved once the Architect's contract exists; until
+  // then (planner/architect) every stage is a candidate.
+  let plan: ProjectPlan | null = null;
 
   for (const stageName of PIPELINE as StageName[]) {
     if (!scope.includes(stageName)) continue;
 
-    // Deterministic scaffold happens once, right after the contract is frozen.
-    if (stageName === "backend" && !state.isDone("scaffold")) {
+    const def = AGENTS[stageName];
+
+    // Resolve the adaptive plan the moment the frozen contract is available, and
+    // announce it (which agents run, which are skipped, whether Docker is used).
+    if (plan === null && state.hasArtifact("architecture.json")) {
+      plan = resolvePlan(readArchSafe(state), opts.planOverrides ?? {});
+      const skipped = builderStages().filter((s) => !plan!.requiredAgents.includes(s));
+      bus.emit({ type: "run:plan", profile: plan.profile, requiredAgents: plan.requiredAgents, skipped, needsSandbox: plan.needsSandbox });
+    }
+
+    // Skip a builder agent the profile does not need: never spawned, no gate.
+    if (plan && def.mode === "builder" && !plan.requiredAgents.includes(stageName)) {
+      if (!skippedStages.includes(stageName)) skippedStages.push(stageName);
+      state.setStage(stageName, "skipped", `skipped: ${plan.profile}`);
+      bus.emit({ type: "stage:skipped", stage: stageName, reason: plan.profile });
+      continue;
+    }
+
+    // Deterministic scaffold happens once, before the first builder that runs.
+    if (def.mode === "builder" && !state.isDone("scaffold")) {
       scaffoldWorkspace(state, sandbox);
       state.setStage("scaffold", "done");
     }
@@ -96,7 +139,6 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
       continue;
     }
 
-    const def = AGENTS[stageName];
     let decision: CheckpointDecision = "continue";
 
     do {
@@ -111,7 +153,7 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
           // resumable (do NOT mark it failed) so it retries once the sandbox is
           // fixed, and report it as an environment error.
           bus.emit({ type: "env:error", stage: stageName, message: err.message, hint: err.hint });
-          return { state, completed, stoppedAt: stageName, aborted: true, infra: { message: err.message, hint: err.hint } };
+          return { state, completed, skipped: skippedStages, profile: plan?.profile, stoppedAt: stageName, aborted: true, infra: { message: err.message, hint: err.hint } };
         }
         throw err;
       }
@@ -120,7 +162,7 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
       if (opts.control?.stopRequested) {
         state.setStage(stageName, "failed", "stopped by operator");
         bus.emit({ type: "run:error", stage: stageName, error: "stopped by operator" });
-        return { state, completed, stoppedAt: stageName, aborted: true };
+        return { state, completed, skipped: skippedStages, profile: plan?.profile, stoppedAt: stageName, aborted: true };
       }
 
       bus.emit({ type: "stage:gate", stage: stageName, passed: gate.pass, detail: gate.detail });
@@ -128,7 +170,7 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
       if (!gate.pass) {
         state.setStage(stageName, "failed", gate.detail.slice(0, 500));
         bus.emit({ type: "run:error", stage: stageName, error: gate.detail });
-        return { state, completed, stoppedAt: stageName, aborted: true };
+        return { state, completed, skipped: skippedStages, profile: plan?.profile, stoppedAt: stageName, aborted: true };
       }
 
       state.setStage(stageName, "done", gate.detail.slice(0, 500));
@@ -143,7 +185,7 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
 
       if (opts.stopAfter && stageName === opts.stopAfter) {
         completed.push(stageName);
-        return { state, completed, stoppedAt: stageName, aborted: false };
+        return { state, completed, skipped: skippedStages, profile: plan?.profile, stoppedAt: stageName, aborted: false };
       }
 
       decision = "continue";
@@ -152,7 +194,7 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
         bus.emit({ type: "checkpoint:await", stage: stageName, artifactPaths });
         decision = await opts.checkpoint({ stage: stageName, gate, state, artifactPaths });
         if (decision === "quit") {
-          return { state, completed, stoppedAt: stageName, aborted: true };
+          return { state, completed, skipped: skippedStages, profile: plan?.profile, stoppedAt: stageName, aborted: true };
         }
         // "retry" re-runs this stage's agent (e.g. the contract needs redoing).
       }
@@ -167,7 +209,7 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
     workspacePath: state.workspaceDir,
     summary: `${completed.length} stage(s) completed: ${completed.join(", ")}`,
   });
-  return { state, completed, aborted: false };
+  return { state, completed, skipped: skippedStages, profile: plan?.profile, aborted: false };
 }
 
 interface PlanTask {
