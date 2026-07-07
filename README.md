@@ -22,23 +22,41 @@ runnable project in `runs/<id>/workspace/` at the end.
 - **Agents are tool-loops, not one-shot prompts.** Each sees its own errors and
   fixes them until a real validation gate passes (server boots, tests pass,
   build succeeds).
-- **DeepSeek by default, any OpenAI-compatible provider in one line.** OpenAI,
-  local Ollama/LM Studio, gateways — all first-class.
+- **DeepSeek, OpenAI, and Anthropic are equal first-class providers.** Pick one
+  with `ELEVATE_LLM=provider/model`; set only that provider's key. Built on the
+  Vercel AI SDK, so tool-calling is identical across all three.
+
+---
+
+## Screenshots
+
+<!-- TODO: add screenshots of the new UI into docs/screenshots/ and update paths below -->
+![Splash screen](docs/screenshots/splash.png)
+![Pipeline running](docs/screenshots/tui-running.png)
+![Agent tree + usage](docs/screenshots/tui-sidebar.png)
 
 ---
 
 ## Quickstart
 
-**1. Paste your DeepSeek API key into `.env`.**
+**1. Pick a provider and paste its API key into `.env`.**
 
-On first run the tool copies `.env.example` to `.env` for you. Open `.env` and
-put your key on the one line that matters:
+On first run the tool copies `.env.example` to `.env` for you. Open `.env`,
+choose the active model, and set the key for *that* provider only:
 
 ```
-LLM_API_KEY=sk-your-deepseek-key
+# Pick ONE active model: provider/model  (provider ∈ deepseek | openai | anthropic)
+ELEVATE_LLM=deepseek/deepseek-chat
+
+# Set the key for the provider you chose (only that one is required)
+DEEPSEEK_API_KEY=sk-your-deepseek-key
+OPENAI_API_KEY=
+ANTHROPIC_API_KEY=
 ```
 
-That's the only thing you have to set. Everything else has a working default.
+DeepSeek is shown here because it's the cheapest way to try the whole pipeline,
+but the three providers are equal — switch by changing `ELEVATE_LLM` and setting
+the matching key. Everything else has a working default.
 
 **2. Install and run.**
 
@@ -182,9 +200,9 @@ Examples:
 # Inspect the frozen contract, then stop
 elevateurskills --request "a URL shortener" --stop-after architect
 
-# Autonomous, with a stronger model for the architect only
+# Autonomous, mixing providers: a stronger model for the architect only
 elevateurskills --request "a booking API" --auto \
-  --model architect=openai/gpt-4o --model backend=deepseek/deepseek-chat
+  --model architect=anthropic/claude-opus-4-8 --model backend=deepseek/deepseek-chat
 
 # Resume a run that stopped
 elevateurskills --resume 20260706-230126-tpx6
@@ -197,37 +215,55 @@ elevateurskills --resume 20260706-230126-tpx6
 Everything lives in one `.env` at the repo root:
 
 ```
-# The only thing you must set:
-LLM_API_KEY=sk-your-deepseek-key
-
-# Defaults — leave as-is for DeepSeek:
+# Pick ONE active model: provider/model  (provider ∈ deepseek | openai | anthropic)
 ELEVATE_LLM=deepseek/deepseek-chat
-LLM_API_BASE=https://api.deepseek.com
+
+# Set the key for the provider you chose (only that one is required)
+DEEPSEEK_API_KEY=
+OPENAI_API_KEY=
+ANTHROPIC_API_KEY=
+
+# Optional: override base URL for local / OpenAI-compatible endpoints
+# LLM_API_BASE=
 ```
 
-`ELEVATE_LLM` is `provider/model`. The provider segment is a human label; the
-actual endpoint is `LLM_API_BASE` and the key is `LLM_API_KEY`.
+`ELEVATE_LLM` is `provider/model`. To switch providers you change that one line
+and set the matching key — nothing else:
+
+```bash
+ELEVATE_LLM=deepseek/deepseek-chat      # DEEPSEEK_API_KEY
+ELEVATE_LLM=openai/gpt-5.1              # OPENAI_API_KEY
+ELEVATE_LLM=anthropic/claude-sonnet-5   # ANTHROPIC_API_KEY
+```
+
+The default model id for each provider lives in one place —
+`src/core/models.ts` (`MODELS`) — with a "verify these" note, since model names
+change over time. On startup the tool checks that the chosen provider's key is
+present and, if not, exits naming the exact env var to set.
+
+Per-agent overrides can cross providers: `--model architect=anthropic/claude-opus-4-8`
+runs the Architect on Anthropic while the rest of the pipeline stays on your
+active provider. Each model resolves its own provider's key, so you'll need both
+keys set for a mixed run. To make an override the default, add it to
+`AGENT_MODEL_DEFAULTS` in `src/core/models.ts`.
+
+`LLM_API_BASE` is optional and applies to whichever provider is active — use it
+to point at a local or OpenAI-compatible endpoint (e.g. an OpenAI-compatible
+gateway, or LM Studio via `ELEVATE_LLM=openai/...`).
 
 ### Adding a provider
 
-There is no provider plugin system to learn — every provider is reached through
-the same OpenAI-compatible Chat Completions shape in `src/core/llm.ts`. To
-switch, edit three lines in `.env`:
+Each provider is one small adapter in `src/core/llm.ts` (built on the Vercel AI
+SDK, which keeps tool-calling identical across providers). To add a fourth:
 
-```bash
-# OpenAI
-LLM_API_KEY=sk-...
-ELEVATE_LLM=openai/gpt-4o
-LLM_API_BASE=https://api.openai.com/v1
+1. Install its AI SDK package, e.g. `npm install @ai-sdk/google`.
+2. In `src/core/models.ts`: add the provider id to `ProviderId` / `PROVIDERS`,
+   a default model to `MODELS`, and its key env var to `KEY_ENV`.
+3. In `src/core/llm.ts`: import its `create*` factory and add one `case` to the
+   `switch` in `modelInstance()`.
 
-# Local Ollama
-LLM_API_KEY=ollama                     # any non-empty string
-ELEVATE_LLM=ollama/llama3.1
-LLM_API_BASE=http://localhost:11434/v1
-```
-
-If a provider needs a genuinely different request shape, `src/core/llm.ts` is
-the single, isolated place to add it.
+That's the entire surface — everything else (key preflight, per-agent overrides,
+the CLI) is driven off those config maps.
 
 ### Adding an agent
 
@@ -256,8 +292,9 @@ Each command runs in a throwaway container built from `sandbox/Dockerfile`
 - only the run's `workspace/` is mounted; the working dir is that mount
 - all Linux capabilities dropped, `no-new-privileges`, memory/CPU/pids capped
 - the host environment is **never** passed in — only the generated project's own
-  vars (e.g. `DATABASE_URL`) are injected, and the LLM provider key is filtered
-  out so project code can never see it
+  vars (e.g. `DATABASE_URL`) are injected, and every provider key
+  (`DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) is filtered out so
+  project code can never see it
 - default bridge network (outbound for `npm`/`prisma`), never the host network
 - per-command timeout that kills the container
 
@@ -276,8 +313,9 @@ the guards are best-effort, not a security boundary:
   expected toolchain without friction; anything else needs an interactive
   confirm, and is **refused** under `--auto`
 - **environment stripping:** commands get a minimal env with `HOME` redirected
-  to a scratch dir; `LLM_API_KEY`, `LLM_API_BASE`, `ELEVATE_LLM` and other
-  secrets are never present
+  to a scratch dir; every provider key (`DEEPSEEK_API_KEY`, `OPENAI_API_KEY`,
+  `ANTHROPIC_API_KEY`), `LLM_API_BASE`, `ELEVATE_LLM` and other secrets are
+  never present
 - **consent:** the first local run asks you to type `yes`; `--auto` + local is
   refused unless you pass `--i-understand-local`
 
