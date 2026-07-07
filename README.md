@@ -31,9 +31,9 @@ runnable project in `runs/<id>/workspace/` at the end.
 ## Screenshots
 
 <!-- TODO: add screenshots of the new UI into docs/screenshots/ and update paths below -->
-![Splash screen](docs/screenshots/splash.png)
-![Pipeline running](docs/screenshots/tui-running.png)
-![Agent tree + usage](docs/screenshots/tui-sidebar.png)
+
+<img width="1030" height="567" alt="elevateurskills" src="https://github.com/user-attachments/assets/330ead0d-6d62-46e9-bc9e-c58899c27391" />
+<img width="1026" height="601" alt="agent" src="https://github.com/user-attachments/assets/dbc76b8f-15ea-4acf-957f-f580ad7e53ed" />
 
 ---
 
