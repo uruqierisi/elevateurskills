@@ -13,6 +13,8 @@ import { termWidth, truncate, clockTime, humanDuration, humanTokens, estimateCos
 
 export interface Renderer {
   awaitCheckpoint(stage: string, artifactPaths: string[]): Promise<CheckpointDecision>;
+  /** Ask the operator to approve a non-allowlisted command. */
+  confirm(question: string): Promise<boolean>;
   /** Pending steer/instruction lines submitted via the UI (TUI only). */
   drainSteers?(): string[];
   stop(): void;
@@ -93,9 +95,15 @@ export function attachPlainRenderer(bus: EventBus, opts: { model?: string } = {}
           chalk.dim(`Inspect: ${artifactPaths.join(", ")}\n`) +
           `  ${chalk.bold("[c]")} continue   ${chalk.bold("[r]")} retry stage   ${chalk.bold("[q]")} quit  `,
       );
-      const decision = await readSingleKey();
+      const key = await readOneKey(["c", "r", "q"]);
       process.stdout.write("\n");
-      return decision;
+      return key === "r" ? "retry" : key === "q" ? "quit" : "continue";
+    },
+    async confirm(question: string): Promise<boolean> {
+      process.stdout.write(chalk.yellow(`\n${question}\n`) + `  ${chalk.bold("[y]")} run   ${chalk.bold("[n]")} refuse  `);
+      const key = await readOneKey(["y", "n"]);
+      process.stdout.write("\n");
+      return key === "y";
     },
     stop() {
       unsubscribe();
@@ -103,18 +111,23 @@ export function attachPlainRenderer(bus: EventBus, opts: { model?: string } = {}
   };
 }
 
-/** Read one keypress (c/r/q) without requiring Enter, degrading to readline. */
-function readSingleKey(): Promise<CheckpointDecision> {
+/**
+ * Read one keypress from a set of valid keys without requiring Enter, degrading
+ * to a full-line read on non-TTY stdin. Returns the first valid key (lowercased)
+ * or the set's first element as the default.
+ */
+function readOneKey(valid: string[]): Promise<string> {
   const stdin = process.stdin;
+  const fallback = valid[0];
   const canRaw = stdin.isTTY && typeof stdin.setRawMode === "function";
 
   if (!canRaw) {
-    // Non-TTY: read a whole line.
     const rl = createInterface({ input: stdin, output: process.stdout });
     return new Promise((resolve) => {
       rl.question("", (answer) => {
         rl.close();
-        resolve(mapKey(answer.trim().toLowerCase()[0] ?? "c"));
+        const ch = answer.trim().toLowerCase()[0] ?? fallback;
+        resolve(valid.includes(ch) ? ch : fallback);
       });
     });
   }
@@ -124,22 +137,16 @@ function readSingleKey(): Promise<CheckpointDecision> {
   stdin.resume();
   return new Promise((resolve) => {
     const onKey = (_str: string, key: { name?: string; ctrl?: boolean; sequence?: string }) => {
-      const name = key.name ?? key.sequence ?? "";
+      const name = (key.name ?? key.sequence ?? "").toLowerCase();
       if (key.ctrl && name === "c") return finish("q");
-      if (name === "c" || name === "r" || name === "q") finish(name);
+      if (valid.includes(name)) finish(name);
     };
     function finish(k: string) {
       stdin.off("keypress", onKey);
       if (stdin.isTTY) stdin.setRawMode(false);
       stdin.pause();
-      resolve(mapKey(k));
+      resolve(valid.includes(k) ? k : fallback);
     }
     stdin.on("keypress", onKey);
   });
-}
-
-function mapKey(k: string): CheckpointDecision {
-  if (k === "r") return "retry";
-  if (k === "q") return "quit";
-  return "continue";
 }

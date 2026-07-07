@@ -39,6 +39,7 @@ const STATUS_HEIGHT = 1;
 interface Store {
   model: TuiModel;
   checkpointResolver: ((d: CheckpointDecision) => void) | null;
+  confirmReq: { question: string; resolve: (approved: boolean) => void } | null;
   steers: string[];
   control: RunControl | null;
   onQuit: (() => void) | null;
@@ -244,6 +245,15 @@ export function Dashboard({ store }: { store: Store }): React.ReactElement {
   const lines = transcriptLines(m.blocks, contentWidth, theme.accent);
 
   useInput((inputChar, key) => {
+    // Command confirm: single-key y/n, input box disabled.
+    if (store.confirmReq) {
+      if (inputChar === "y" || inputChar === "n") {
+        const { resolve } = store.confirmReq;
+        store.confirmReq = null;
+        resolve(inputChar === "y");
+      }
+      return;
+    }
     // Checkpoint: single-key decisions, input box disabled.
     if (m.checkpoint && store.checkpointResolver) {
       let decision: CheckpointDecision | null = null;
@@ -275,7 +285,7 @@ export function Dashboard({ store }: { store: Store }): React.ReactElement {
 
   if (m.phase === "splash") return <Splash m={m} />;
 
-  const inputActive = !m.checkpoint;
+  const inputActive = !m.checkpoint && !store.confirmReq;
   return (
     <Box flexDirection="column" width={cols} height={rows}>
       <Box flexDirection="row" height={topHeight}>
@@ -289,6 +299,16 @@ export function Dashboard({ store }: { store: Store }): React.ReactElement {
           <UsageBox m={m} />
         </Box>
       </Box>
+      {store.confirmReq ? (
+        <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1}>
+          <Text color="yellow" bold>
+            {store.confirmReq.question}
+          </Text>
+          <Text>
+            <Text bold>[y]</Text> run   <Text bold>[n]</Text> refuse
+          </Text>
+        </Box>
+      ) : null}
       <StatusBar m={m} />
       <InputArea
         value={input}
@@ -311,6 +331,7 @@ export function attachTuiRenderer(bus: EventBus, opts: { model?: string; control
   const store: Store = {
     model: initModel(packageVersion(), Date.now()),
     checkpointResolver: null,
+    confirmReq: null,
     steers: [],
     control: opts.control ?? null,
     onQuit: null,
@@ -333,6 +354,11 @@ export function attachTuiRenderer(bus: EventBus, opts: { model?: string; control
       return new Promise((resolve) => {
         store.model = { ...store.model, checkpoint: { stage, artifactPaths } };
         store.checkpointResolver = resolve;
+      });
+    },
+    confirm(question: string): Promise<boolean> {
+      return new Promise((resolve) => {
+        store.confirmReq = { question, resolve };
       });
     },
     drainSteers(): string[] {

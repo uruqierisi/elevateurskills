@@ -12,6 +12,10 @@ export interface ToolContext {
   sandbox: Sandbox;
   log: (msg: string) => void;
   state?: StateAccess;
+  /** Autonomous run: no interactive prompts are available. */
+  auto?: boolean;
+  /** Ask the operator to approve an action (interactive runs only). */
+  confirm?: (question: string) => Promise<boolean>;
   /** Orchestrator-only: spawn a specialist subagent and await its result. */
   spawnSubagent?: (input: { agent: string; task: string }) => Promise<string>;
 }

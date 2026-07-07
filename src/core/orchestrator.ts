@@ -38,6 +38,8 @@ export interface OrchestratorOptions {
   drainSteers?: () => string[];
   /** Cooperative stop flag toggled by the UI (ctrl-q / esc). */
   control?: RunControl;
+  /** Ask the operator to approve a non-allowlisted command (interactive only). */
+  confirm?: (question: string) => Promise<boolean>;
   /**
    * Resolves a paused checkpoint. Provided by whichever renderer is active
    * (TUI keypress or plain readline). Omitted => behave as "continue".
@@ -228,6 +230,8 @@ async function runStageWithRetries(
       sandbox,
       state: state.stateAccess(),
       log: (m) => state.appendLog(def.name, `[tool] ${m}`),
+      auto: opts.auto,
+      confirm: opts.confirm,
     };
 
     const task = def.buildTask(state) + extraContext;

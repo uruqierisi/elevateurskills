@@ -92,6 +92,7 @@ async function main() {
       bus,
       control,
       drainSteers: () => renderer.drainSteers?.() ?? [],
+      confirm: opts.auto ? undefined : (question) => renderer.confirm(question),
       checkpoint: opts.auto ? undefined : (info) => renderer.awaitCheckpoint(info.stage, info.artifactPaths),
     });
 
