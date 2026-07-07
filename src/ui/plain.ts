@@ -78,6 +78,12 @@ export function attachPlainRenderer(bus: EventBus, opts: { model?: string } = {}
         line(e.ts, chalk.red(`✗ ${e.stage} error`) + chalk.dim(` — ${e.error.split("\n")[0]}`));
         line(e.ts, chalk.dim("  orchestrator will re-spawn the agent with the failure context"));
         break;
+      case "env:error":
+        line(e.ts, chalk.red.bold(`⚠ environment error at ${e.stage}`) + chalk.dim(" — not a code failure"));
+        line(e.ts, chalk.red(`  ${e.message}`));
+        line(e.ts, chalk.dim(`  ${e.hint}`));
+        line(e.ts, chalk.dim(`  the stage is resumable — fix the environment and re-run with --resume`));
+        break;
       case "run:done": {
         const cost = formatCostUsd(estimateCostUsd(totalTokens, model));
         line(e.ts, chalk.bold.green(`✅ run complete`) + chalk.dim(` · ${humanTokens(totalTokens)} tok ~${cost} · ${e.workspacePath}`));

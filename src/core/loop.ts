@@ -1,5 +1,6 @@
 import { chatCompletion, type LlmMessage } from "./llm.js";
 import { toolSchemas, type Tool, type ToolContext } from "./tools/index.js";
+import { SandboxInfraError } from "./sandbox.js";
 
 /**
  * The agent loop. This is the heart of the system: an act -> observe -> correct
@@ -124,6 +125,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<AgentRunResult> {
           resultText = r.content;
           emit({ type: "tool_result", text: `${r.ok ? "ok" : "FAIL"}: ${truncate(r.content)}`, toolName: tool.name });
         } catch (err) {
+          // A sandbox infrastructure failure is not the agent's fault — let it
+          // propagate to halt the run instead of feeding it back as a tool
+          // result the model would fruitlessly try to "fix".
+          if (err instanceof SandboxInfraError) throw err;
           resultText = `Error executing ${tool.name}: ${err instanceof Error ? err.message : String(err)}`;
           emit({ type: "error", text: resultText, toolName: tool.name });
         }

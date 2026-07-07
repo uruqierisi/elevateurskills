@@ -26,7 +26,10 @@ export type PipelineEvent =
   | { type: "usage"; model: string; promptTokens: number; completionTokens: number; totalTokens: number }
   | { type: "checkpoint:await"; stage: string; artifactPaths: string[] }
   | { type: "run:done"; runId: string; workspacePath: string; summary: string; repoUrl?: string }
-  | { type: "run:error"; stage: string; error: string };
+  | { type: "run:error"; stage: string; error: string }
+  // Environment/infrastructure failure (e.g. Docker daemon down, image missing):
+  // NOT the agent's code failing its gate. The stage is left resumable.
+  | { type: "env:error"; stage: string; message: string; hint: string };
 
 /** Event as delivered to handlers: the payload plus an emit timestamp. */
 export type StampedEvent = PipelineEvent & { ts: number };

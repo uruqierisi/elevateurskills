@@ -147,6 +147,13 @@ export function applyEvent(m: TuiModel, e: StampedEvent): TuiModel {
       return push(marked, { kind: "gate", stage: e.stage, passed: false, detail: e.error });
     }
 
+    case "env:error": {
+      // Environment failure — deliberately do NOT mark the node "failed": the
+      // code didn't fail, the sandbox did. Surface it as a distinct message.
+      const detail = `environment error (not your code): ${e.message}\n${e.hint}\nstage is resumable — fix the environment and re-run with --resume`;
+      return push({ ...m, errorStage: e.stage }, { kind: "gate", stage: e.stage, passed: false, detail });
+    }
+
     case "run:done":
       return { ...m, finished: true, workspacePath: e.workspacePath };
 

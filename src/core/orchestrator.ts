@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { runAgent } from "./loop.js";
-import { createSandbox, type Sandbox, type SandboxOptions } from "./sandbox.js";
+import { createSandbox, SandboxInfraError, type Sandbox, type SandboxOptions } from "./sandbox.js";
 import { RunState, type StageName } from "./state.js";
 import { AGENTS, PIPELINE, agentSystemPrompt, type AgentDef, type GateResult } from "./agents.js";
 import { scaffoldWorkspace } from "./scaffold.js";
@@ -53,6 +53,8 @@ export interface OrchestratorResult {
   completed: string[];
   stoppedAt?: string;
   aborted: boolean;
+  /** Set when the run halted on a sandbox/environment failure, not a gate. */
+  infra?: { message: string; hint: string };
 }
 
 interface Usage {
@@ -99,7 +101,20 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
 
     do {
       const startedAt = Date.now();
-      const { gate, usage } = await runStageWithRetries(def, state, sandbox, opts);
+      let gate: GateResult;
+      let usage: Usage;
+      try {
+        ({ gate, usage } = await runStageWithRetries(def, state, sandbox, opts));
+      } catch (err) {
+        if (err instanceof SandboxInfraError) {
+          // Environment failure, not a code/gate failure. Leave the stage
+          // resumable (do NOT mark it failed) so it retries once the sandbox is
+          // fixed, and report it as an environment error.
+          bus.emit({ type: "env:error", stage: stageName, message: err.message, hint: err.hint });
+          return { state, completed, stoppedAt: stageName, aborted: true, infra: { message: err.message, hint: err.hint } };
+        }
+        throw err;
+      }
 
       // Operator asked to stop (ctrl-q / esc): unwind cleanly as aborted.
       if (opts.control?.stopRequested) {
