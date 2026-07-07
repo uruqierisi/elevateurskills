@@ -171,6 +171,7 @@ elevateurskills [options]
   --stop-after <stage>     stop after a given stage (e.g. architect)
   --only <stages>          run only a subset, comma-separated
   --backend <mode>         sandbox: auto | docker | local (default: auto)
+  --i-understand-local     consent to run model-generated commands on your host
   --max-attempts <n>       gate retries per stage (default: 2)
   --model <agent=spec>     per-agent model override (repeatable)
 ```
@@ -243,11 +244,45 @@ validation gate — are exactly those three touch points.
 
 ## Sandbox
 
-By default the tool uses Docker when it's installed, building the image in
-`sandbox/Dockerfile` (Node 20 + Postgres client + Chromium libs). Without
-Docker it falls back to a **local sandbox**: commands still run, confined to the
-run's `workspace/` directory, but on the host — you'll see a warning. Install
-Docker, or pass `--backend docker`, for full isolation.
+Agents run real shell commands, so where those commands run matters. Two
+backends, selected by `--backend docker|local|auto` (default `auto`: Docker if
+the daemon is reachable, else local).
+
+### Docker backend (recommended, real isolation)
+
+Each command runs in a throwaway container built from `sandbox/Dockerfile`
+(Node 20 + Postgres client + Chromium libs), hardened by default:
+
+- only the run's `workspace/` is mounted; the working dir is that mount
+- all Linux capabilities dropped, `no-new-privileges`, memory/CPU/pids capped
+- the host environment is **never** passed in — only the generated project's own
+  vars (e.g. `DATABASE_URL`) are injected, and the LLM provider key is filtered
+  out so project code can never see it
+- default bridge network (outbound for `npm`/`prisma`), never the host network
+- per-command timeout that kills the container
+
+Use Docker for anything untrusted or unattended.
+
+### Local backend (fallback — NOT real isolation)
+
+When Docker is absent, commands run **on your machine**. This is guarded, but
+the guards are best-effort, not a security boundary:
+
+- **path confinement:** all file tools resolve through `realpath` and reject
+  anything (including symlinks) that escapes `runs/<id>/workspace`
+- **command screening:** a denylist refuses obviously dangerous commands
+  (`sudo`, `rm -rf` outside the workspace, `curl|wget | sh`, global installs,
+  `shutdown`/`mkfs`, redirects writing outside cwd, …); an allowlist runs the
+  expected toolchain without friction; anything else needs an interactive
+  confirm, and is **refused** under `--auto`
+- **environment stripping:** commands get a minimal env with `HOME` redirected
+  to a scratch dir; `LLM_API_KEY`, `LLM_API_BASE`, `ELEVATE_LLM` and other
+  secrets are never present
+- **consent:** the first local run asks you to type `yes`; `--auto` + local is
+  refused unless you pass `--i-understand-local`
+
+If you're running untrusted requests or leaving it unattended, use
+`--backend docker`.
 
 ---
 
