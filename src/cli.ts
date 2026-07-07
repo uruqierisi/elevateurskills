@@ -10,6 +10,7 @@ import { orchestrate } from "./core/orchestrator.js";
 import { PIPELINE } from "./core/agents.js";
 import { resolveModelId, checkKeysForModels } from "./core/llm.js";
 import { AGENT_MODEL_DEFAULTS } from "./core/models.js";
+import { isProfileId, PROFILE_IDS, type PlanOverrides } from "./core/profile.js";
 import { EventBus } from "./core/events.js";
 import { LOCAL_MODE_WARNING } from "./core/sandbox.js";
 import { attachRenderer } from "./ui/index.js";
@@ -30,6 +31,11 @@ import type { StageName } from "./core/state.js";
 async function main() {
   loadEnv();
 
+  // `--no-backend` would collide with commander's negation of `--backend <mode>`
+  // (the sandbox backend), so detect it ourselves and strip it before parsing.
+  const noBackend = process.argv.includes("--no-backend");
+  const argv = process.argv.filter((a) => a !== "--no-backend");
+
   const program = new Command();
   program
     .name("elevateurskills")
@@ -44,10 +50,14 @@ async function main() {
     .option("--stop-after <stage>", "stop after this stage")
     .option("--only <stages>", "comma-separated subset of stages to run")
     .option("--backend <mode>", "sandbox backend: auto | docker | local", "auto")
+    .option("--profile <id>", "force project profile: static-site | frontend-app | api-only | fullstack")
+    .option("--agents <list>", "force an explicit comma-separated agent set (architect always included)")
+    .option("--force-backend", "pull the backend agent back in (implies sandbox + database)", false)
     .option("--max-attempts <n>", "gate retry attempts per stage", "2")
     .option("--runs-dir <path>", "runs directory", "runs")
     .option("--model <spec...>", "per-agent model override, e.g. architect=openai/gpt-4o")
-    .parse(process.argv);
+    .addHelpText("after", "\n  --no-backend             drop the backend agent (adaptive-pipeline toggle)")
+    .parse(argv);
 
   const opts = program.opts();
 
@@ -69,6 +79,25 @@ async function main() {
   if (opts.stopAfter && !validStages.has(opts.stopAfter)) {
     fatal(`Unknown --stop-after stage "${opts.stopAfter}". Valid: ${PIPELINE.join(", ")}`);
   }
+
+  if (opts.profile && !isProfileId(opts.profile)) {
+    fatal(`Unknown --profile "${opts.profile}". Valid: ${PROFILE_IDS.join(", ")}`);
+  }
+  const agentSet = opts.agents
+    ? String(opts.agents)
+        .split(",")
+        .map((s: string) => s.trim())
+        .filter(Boolean)
+    : undefined;
+  if (agentSet) {
+    for (const a of agentSet) if (!validStages.has(a)) fatal(`Unknown agent "${a}" in --agents. Valid: ${PIPELINE.join(", ")}`);
+  }
+  const planOverrides: PlanOverrides = {
+    profile: opts.profile as PlanOverrides["profile"],
+    agents: agentSet,
+    forceBackend: !!opts.forceBackend,
+    noBackend,
+  };
 
   const models: Record<string, string> = {};
   for (const spec of (opts.model ?? []) as string[]) {
@@ -120,6 +149,7 @@ async function main() {
       maxAttempts: Number(opts.maxAttempts) || 2,
       sandbox: { backend: backendIntent },
       localConsent,
+      planOverrides,
       models,
       bus,
       control,
