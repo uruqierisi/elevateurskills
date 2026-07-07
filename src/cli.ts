@@ -11,7 +11,7 @@ import { PIPELINE } from "./core/agents.js";
 import { resolveModelId, checkKeysForModels } from "./core/llm.js";
 import { AGENT_MODEL_DEFAULTS } from "./core/models.js";
 import { EventBus } from "./core/events.js";
-import { resolveBackend, LOCAL_MODE_WARNING } from "./core/sandbox.js";
+import { resolveBackend, LOCAL_MODE_WARNING, ensureSandboxImage, SandboxInfraError } from "./core/sandbox.js";
 import { attachRenderer } from "./ui/index.js";
 import type { StageName } from "./core/state.js";
 
@@ -93,8 +93,22 @@ async function main() {
   } catch (e) {
     fatal(e instanceof Error ? e.message : String(e));
   }
+  // Sandbox image is threaded into the orchestrator so the container runs the
+  // exact tag the preflight verified/built.
+  let sandboxImage: string | undefined;
   if (backend === "docker") {
-    console.log(chalk.dim("[sandbox] Docker mode — commands run in an isolated container."));
+    // Preflight BEFORE the planner runs: the daemon is reachable (resolveBackend
+    // already checked) and the image exists — build it if missing. Failing here
+    // costs zero tokens; failing at the backend gate wastes the whole planner +
+    // architect run.
+    try {
+      const { tag, built } = ensureSandboxImage((l) => console.log(chalk.dim(l)));
+      sandboxImage = tag;
+      console.log(chalk.dim(`[sandbox] docker ok · image ${tag} ${built ? "built" : "ready"}`));
+    } catch (e) {
+      if (e instanceof SandboxInfraError) fatal(`${e.message}\n${e.hint}`);
+      fatal(e instanceof Error ? e.message : String(e));
+    }
   } else {
     console.log(chalk.yellow(LOCAL_MODE_WARNING));
     await ensureLocalConsent(!!opts.auto, !!opts.iUnderstandLocal);
@@ -114,7 +128,7 @@ async function main() {
       stopAfter: opts.stopAfter as StageName | undefined,
       only: only as StageName[] | undefined,
       maxAttempts: Number(opts.maxAttempts) || 2,
-      sandbox: { backend },
+      sandbox: { backend, image: sandboxImage },
       models,
       bus,
       control,
@@ -125,6 +139,21 @@ async function main() {
 
     renderer.stop();
     printFinalSummary(result);
+    if (result.infra) {
+      // Environment failure, not a code failure — make that unmistakable and
+      // point at the fix. The stage was left resumable.
+      process.stderr.write(
+        "\n" +
+          chalk.red.bold("⚠ environment error — the sandbox could not run, this is NOT your code.") +
+          "\n" +
+          chalk.red(`  ${result.infra.message}`) +
+          "\n" +
+          chalk.dim(`  ${result.infra.hint}`) +
+          "\n" +
+          chalk.dim(`  Fix the environment and resume: elevateurskills --resume ${result.state.manifest.id}`) +
+          "\n",
+      );
+    }
     // Set exit code and let Node drain — a hard process.exit races the TUI's
     // stdin/timer handle cleanup and can trip a libuv assertion on Windows.
     if (result.aborted) process.exitCode = 1;
