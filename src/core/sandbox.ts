@@ -1,6 +1,8 @@
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, existsSync, realpathSync } from "node:fs";
+import { mkdirSync, existsSync, realpathSync, readFileSync } from "node:fs";
 import { isAbsolute, resolve, relative, sep, dirname } from "node:path";
+import { createHash } from "node:crypto";
+import { REPO_ROOT } from "./env.js";
 
 /**
  * Execution sandbox. All tool file/shell operations go through a Sandbox so
@@ -22,6 +24,24 @@ export interface ExecResult {
   exitCode: number;
   /** True when the process was killed by the timeout. */
   timedOut: boolean;
+}
+
+/**
+ * A sandbox-level (infrastructure) failure — the Docker daemon is unreachable,
+ * the image is missing, a mount/permission failed, etc. This is NOT the agent's
+ * code failing its gate: it means the environment could not run the command at
+ * all. It propagates out of the agent loop to halt the run cleanly (the stage is
+ * left resumable, not marked failed) so we never blame generated code for a
+ * broken sandbox.
+ */
+export class SandboxInfraError extends Error {
+  /** A short, actionable hint on how to fix the environment. */
+  readonly hint: string;
+  constructor(message: string, hint: string) {
+    super(message);
+    this.name = "SandboxInfraError";
+    this.hint = hint;
+  }
 }
 
 export interface ExecOptions {
@@ -103,6 +123,11 @@ function confinePath(root: string, relPath: string): string {
 
 function clip(s: string): string {
   return s.length > MAX_OUTPUT_CHARS ? s.slice(0, MAX_OUTPUT_CHARS) + "\n…[truncated]" : s;
+}
+
+/** First non-empty line of a string (for compact error messages). */
+function firstLine(s: string): string {
+  return s.split("\n").map((l) => l.trim()).find(Boolean) ?? "";
 }
 
 // Environment variable names that are safe to pass through to sandboxed
@@ -306,7 +331,7 @@ export class DockerSandbox implements Sandbox {
     const containerName = `eus-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const args = this.buildRunArgs(command, opts, containerName);
 
-    return new Promise((resolvePromise) => {
+    return new Promise((resolvePromise, rejectPromise) => {
       const child = spawn("docker", args, { shell: false });
       let stdout = "";
       let stderr = "";
@@ -326,21 +351,36 @@ export class DockerSandbox implements Sandbox {
       child.stderr.on("data", (d) => (stderr += d.toString()));
       child.on("close", (code) => {
         clearTimeout(timer);
+        const exitCode = code ?? (timedOut ? 124 : 1);
+        // A daemon-level failure (missing image, unreachable daemon, bad mount)
+        // is NOT the command failing — it means the sandbox could not run it.
+        // Reject so it propagates as an infra halt instead of being fed back to
+        // the agent as if its code were wrong.
+        if (!timedOut && isDockerInfraFailure(exitCode, stderr)) {
+          rejectPromise(
+            new SandboxInfraError(
+              `Docker could not run the sandbox command (exit ${exitCode}): ${firstLine(stderr) || "daemon/image error"}`,
+              `Ensure the Docker daemon is running and the sandbox image is built (preflight builds it: ${this.image}).`,
+            ),
+          );
+          return;
+        }
         resolvePromise({
           stdout: clip(stdout),
           stderr: clip(stderr),
-          exitCode: code ?? (timedOut ? 124 : 1),
+          exitCode,
           timedOut,
         });
       });
       child.on("error", (err) => {
         clearTimeout(timer);
-        resolvePromise({
-          stdout: clip(stdout),
-          stderr: clip(stderr + "\n" + err.message),
-          exitCode: 1,
-          timedOut,
-        });
+        // The docker client itself failed to launch — the environment is broken.
+        rejectPromise(
+          new SandboxInfraError(
+            `Could not launch docker: ${err.message}`,
+            "Is the Docker CLI installed and on PATH, with the daemon running?",
+          ),
+        );
       });
     });
   }
@@ -365,7 +405,90 @@ export interface SandboxOptions {
   image?: string;
 }
 
-const DEFAULT_IMAGE = "elevateurskills-sandbox";
+/**
+ * The sandbox image is OUR image — it is built locally from sandbox/Dockerfile,
+ * never pulled from a registry. Its tag embeds a hash of the Dockerfile, so:
+ *   - the tag is stable across runs → repeat runs reuse the cached image,
+ *   - any change to sandbox/Dockerfile changes the tag → forces a rebuild.
+ * That makes `docker image inspect <tag>` both the existence check and the
+ * cache-freshness check in one, with no separate state to store.
+ */
+const IMAGE_REPO = "elevateurskills-sandbox";
+const SANDBOX_DIR = resolve(REPO_ROOT, "sandbox");
+const DOCKERFILE_PATH = resolve(SANDBOX_DIR, "Dockerfile");
+
+/** The content-addressed image tag for the current Dockerfile. */
+export function sandboxImageTag(dockerfilePath: string = DOCKERFILE_PATH): string {
+  const src = readFileSync(dockerfilePath, "utf8");
+  const hash = createHash("sha256").update(src).digest("hex").slice(0, 12);
+  return `${IMAGE_REPO}:${hash}`;
+}
+
+/** True if an image with this exact tag already exists locally (no pull). */
+function imageExistsLocally(tag: string): boolean {
+  try {
+    const r = spawnSync("docker", ["image", "inspect", tag], { timeout: 10_000, stdio: "ignore" });
+    return r.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+export interface EnsureImageResult {
+  tag: string;
+  built: boolean;
+}
+
+/**
+ * Ensures the sandbox image exists locally, building it from sandbox/Dockerfile
+ * if missing. Never issues a `docker pull` for our tag — a run must never fall
+ * into a registry pull. Build output is streamed to `onLog`. Throws a
+ * SandboxInfraError (not a generic Error) on any failure so callers can present
+ * an environment-level message.
+ */
+export function ensureSandboxImage(onLog: (line: string) => void = () => {}): EnsureImageResult {
+  const tag = sandboxImageTag();
+  if (imageExistsLocally(tag)) return { tag, built: false };
+
+  onLog(`[sandbox] building image ${tag} from ${relative(REPO_ROOT, DOCKERFILE_PATH)} …`);
+  // Build from the sandbox/ context; the Dockerfile has no COPY/ADD, so the
+  // context is minimal. `--pull` here refreshes only the *base* image
+  // (node:20-bookworm-slim) — it never pulls our own tag.
+  const r = spawnSync("docker", ["build", "-t", tag, "-f", DOCKERFILE_PATH, SANDBOX_DIR], {
+    encoding: "utf8",
+    timeout: 20 * 60_000,
+  });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`.trim();
+  if (out) for (const l of out.split("\n")) onLog(l);
+
+  if (r.error || r.status !== 0) {
+    const why = r.error ? r.error.message : `docker build exited ${r.status}`;
+    throw new SandboxInfraError(
+      `Failed to build the sandbox image ${tag}: ${why}`,
+      `Check the Docker daemon and sandbox/Dockerfile, then re-run. You can also build it manually:\n  docker build -t ${tag} -f ${DOCKERFILE_PATH} ${SANDBOX_DIR}`,
+    );
+  }
+  if (!imageExistsLocally(tag)) {
+    throw new SandboxInfraError(
+      `Sandbox image ${tag} was not present after a successful build.`,
+      `Try building it manually: docker build -t ${tag} -f ${DOCKERFILE_PATH} ${SANDBOX_DIR}`,
+    );
+  }
+  return { tag, built: true };
+}
+
+/**
+ * Recognises Docker/daemon-level failures in a `docker run` result. Exit 125
+ * means the daemon rejected the run (missing image, bad mount, daemon error) —
+ * distinct from a non-zero exit of the *command inside* the container. The
+ * stderr patterns catch the same class when the exit code is ambiguous.
+ */
+function isDockerInfraFailure(exitCode: number, stderr: string): boolean {
+  if (exitCode === 125) return true;
+  return /(Cannot connect to the Docker daemon|no such image|manifest unknown|pull access denied|failed to (resolve|mount)|invalid mount|error during connect|repository does not exist)/i.test(
+    stderr,
+  );
+}
 
 /** The honest local-mode warning shown at startup. */
 export const LOCAL_MODE_WARNING = [
@@ -399,7 +522,10 @@ export function resolveBackend(options: SandboxOptions = {}): "docker" | "local"
  */
 export function createSandbox(root: string, options: SandboxOptions = {}): Sandbox {
   const backend = resolveBackend(options);
+  // Default to the content-addressed tag the preflight built/verified, so the
+  // container runs the exact image we ensured — never an untagged name that
+  // `docker run` would try to pull.
   return backend === "docker"
-    ? new DockerSandbox(root, options.image ?? DEFAULT_IMAGE)
+    ? new DockerSandbox(root, options.image ?? sandboxImageTag())
     : new LocalSandbox(root);
 }
