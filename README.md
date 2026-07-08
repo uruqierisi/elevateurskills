@@ -1,4 +1,4 @@
-# elevateurskills
+<img width="816" height="424" alt="elevateurskillslogo" src="https://github.com/user-attachments/assets/bc26c6ce-1d1a-4868-9ecc-dcf8c28676b4" />
 
 **One sentence in, a runnable and tested project out — built by a pipeline of specialist AI agents, each with its own tools and validation gate.**
 
