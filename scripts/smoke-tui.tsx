@@ -68,7 +68,7 @@ try {
   console.log("\n──── real Dashboard frame ────\n" + frame + "\n──────────────────────────────");
   for (const [label, pass] of [
     ["shows orchestrator", frame.includes("orchestrator")] as [string, boolean],
-    ["shows usage box tokens", /tokens/.test(frame)] as [string, boolean],
+    ["shows usage box tokens", /\btok\b/.test(frame)] as [string, boolean],
     ["shows status bar", /esc stop|inspect:/.test(frame)] as [string, boolean],
     ["shows input prompt", frame.includes(">")] as [string, boolean],
   ]) {

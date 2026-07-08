@@ -1,5 +1,9 @@
 # elevateurskills
 
+**One sentence in, a runnable and tested project out — built by a pipeline of specialist AI agents, each with its own tools and validation gate.**
+
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)&nbsp;[![Node](https://img.shields.io/badge/Node-%E2%89%A520-3c873a.svg)](package.json)&nbsp;![Providers](https://img.shields.io/badge/LLM-DeepSeek%20%C2%B7%20OpenAI%20%C2%B7%20Anthropic-6b4fbb.svg)&nbsp;[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
+
 Give it a high-level software request. A team of specialist AI agents plans,
 architects, builds, tests, reviews, and packages a working project — each agent
 running a real act → observe → correct loop with tools (write files, run shell,
@@ -26,6 +30,44 @@ runnable project in `runs/<id>/workspace/` at the end.
   with `ELEVATE_LLM=provider/model`; set only that provider's key. Built on the
   Vercel AI SDK, so tool-calling is identical across all three.
 
+## Demo
+
+![elevateurskills terminal demo](docs/demo.gif)
+
+<sub>Recorded with <a href="https://github.com/charmbracelet/vhs">vhs</a> — regenerate with <code>vhs docs/demo.tape</code>.</sub>
+
+## Contents
+
+- [Why elevateurskills](#why-elevateurskills)
+- [Requirements](#requirements)
+- [Quickstart](#quickstart)
+- [What you get back](#what-you-get-back)
+- [How the pipeline works](#how-the-pipeline-works)
+- [CLI](#cli)
+- [Configuration](#configuration)
+- [Sandbox](#sandbox)
+- [Contributing](#contributing)
+
+## Why elevateurskills
+
+Most AI coding tools are a single agent in one chat loop. elevateurskills is a
+pipeline of specialists with hard contracts between them:
+
+- **Frozen contract between backend and frontend.** The Architect emits
+  `architecture.json` (schema + API + folders); backend and frontend both
+  consume it and neither may change it, so the two sides are built independently
+  without drifting apart.
+- **Per-agent validation gates with retry.** An agent can't report success until
+  a real gate passes (server boots, `prisma generate` + build + tests, the
+  production build). On failure the orchestrator re-spawns it with the error as
+  new context, up to `--max-attempts` times.
+- **Adaptive pipeline that skips agents.** The Architect classifies the request
+  into a profile and runs only the agents it needs — an informational site never
+  starts a backend, a database, or Docker.
+- **Bring your own key, no telemetry, no accounts.** One API key in one `.env`.
+  Nothing is sent anywhere except the LLM provider you choose — no login, no user
+  database, no phone-home.
+
 ---
 
 ## Screenshots
@@ -36,6 +78,15 @@ runnable project in `runs/<id>/workspace/` at the end.
 <img width="1026" height="601" alt="agent" src="https://github.com/user-attachments/assets/dbc76b8f-15ea-4acf-957f-f580ad7e53ed" />
 
 ---
+
+## Requirements
+
+- **Node.js ≥ 20** and **npm**.
+- **Docker** — optional but recommended. It gives the agents a real, isolated
+  sandbox (see [Sandbox](#sandbox)); without it, commands run in a guarded local
+  fallback confined to the run's `workspace/`.
+- **Windows:** run under **WSL2** with the repo in the **Linux** filesystem
+  (`~/...`, not `/mnt/c/...`) — see the WSL tip in [Sandbox](#sandbox).
 
 ## Quickstart
 
@@ -97,9 +148,13 @@ On an interactive terminal you get a live dashboard: a splash, then a scrollable
 transcript of the active agent (🧠 thinking, 📋 plan, ⚙ tool calls, gate
 results, `── handoff ──` dividers) on the left, an agent tree and a
 model/usage box (tokens + rough cost) on the right, and a steer input box at
-the bottom. Type an instruction and press Enter to steer the running agent;
-**PgUp/PgDn** scroll; **esc** stops, **ctrl-q** quits. Piped or CI output falls
-back to clean timestamped log lines — force that anywhere with `--plain`.
+the bottom. Type an instruction and press Enter to steer the running agent.
+Scroll the transcript with the **mouse wheel** or **PgUp/PgDn** — scrolling up
+freezes the viewport and shows a **▼ N new lines** indicator so incoming output
+doesn't yank you to the bottom; **End** (or scrolling back down) re-enables
+follow mode, and **Home/End** jump to top/bottom. **esc** stops, **ctrl-q**
+quits. Piped or CI output falls back to clean timestamped log lines — force that
+anywhere with `--plain`.
 
 The pipeline pauses at a checkpoint between stages so you can inspect the
 Architect's frozen contract before Backend and Frontend build on it —
@@ -126,6 +181,11 @@ The generated project defaults to **Node + Express + Prisma + PostgreSQL**
 pattern with an in-memory implementation for `NODE_ENV=test`, so its test suite
 boots the real Express app and hits every endpoint **without needing a live
 database**.
+
+The generated `docker-compose.yml` publishes only the app ports it needs (the
+frontend, and the API if it's called directly) and **never the database port**,
+and it sets a unique Compose project name — so `docker compose up` won't collide
+with a Postgres already on `5432` or with a previous generation's containers.
 
 ---
 
@@ -423,9 +483,13 @@ If you're running untrusted requests or leaving it unattended, use
   pipeline), and `src/core/agents.ts` (the registry).
 - Keep provider logic inside `src/core/llm.ts` and nowhere else.
 - New tools go in `src/core/tools/` and are added to `ALL_TOOLS`.
-- Verify changes end to end: `npm run smoke:llm` (one completion),
-  `npm run smoke:loop` (a two-tool agent writes and runs a file), and
-  `npm run smoke:tui` (renders the dashboard from synthetic events).
+- **Run the harness before a PR: `npm test`.** It runs the typecheck plus the
+  full smoke suite offline (no API key needed): `smoke:ui` (reducer, viewport,
+  mouse-wheel parser, stats formatter), `smoke:tui` (renders the dashboard from
+  synthetic events), `smoke:loop` (a two-tool agent writes and runs a file),
+  `smoke:limits` (circuit breaker), and `smoke:sandbox` (path confinement,
+  command screening, Docker-arg hardening). `npm run smoke:llm` is separate — it
+  makes one real completion, so it needs a provider key.
 - UI work lives entirely in `src/ui/`. Add or change rendering there; if you
   need new data on screen, add a field to an event in `src/core/events.ts` and
   emit it from the orchestrator — the renderers stay pure consumers.

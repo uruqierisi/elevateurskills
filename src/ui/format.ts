@@ -14,6 +14,29 @@ export function truncate(s: string, n: number): string {
   return flat.slice(0, n - 1) + "…";
 }
 
+/**
+ * Format one stats-box line: a left value and a right-aligned label packed into
+ * `inner` columns. Guarantees:
+ *   - always at least one space between the two, whatever the widths;
+ *   - when they don't both fit, only the RIGHT side (e.g. the model name) is
+ *     shortened, from the END with an ellipsis — its leading characters are
+ *     preserved and the left value is never touched;
+ *   - the result is never wider than `inner`.
+ * The left value is assumed to be the short, must-show side (the token count);
+ * if it alone already fills the width, the right side is dropped rather than
+ * garbling the value.
+ */
+export function formatStatsLine(left: string, right: string, inner: number): string {
+  const width = Math.max(0, Math.floor(inner));
+  if (left.length >= width) return left.slice(0, width);
+  // Columns left for the right side after the value and the mandatory 1 space.
+  const avail = width - left.length - 1;
+  if (avail <= 0) return left; // only room for the value + its trailing margin
+  const right2 = right.length > avail ? truncate(right, avail) : right;
+  const gap = width - left.length - right2.length; // >= 1 by construction
+  return left + " ".repeat(Math.max(1, gap)) + right2;
+}
+
 /** HH:MM:SS for a timestamp. */
 export function clockTime(ts: number): string {
   return new Date(ts).toTimeString().slice(0, 8);

@@ -14,7 +14,8 @@ import {
   type TranscriptBlock,
   type StyledLine,
 } from "../src/ui/model.js";
-import { parseMouseEvents } from "../src/ui/mouse.js";
+import { parseMouseEvents, createMouseFilter } from "../src/ui/mouse.js";
+import { formatStatsLine } from "../src/ui/format.js";
 import { theme } from "../src/ui/theme.js";
 import { Dashboard, stripMouseNoise } from "../src/ui/tui.js";
 
@@ -53,12 +54,127 @@ check(
 );
 check("stateless across calls (no leftover regex index)", JSON.stringify(parseMouseEvents("\x1b[<64;1;1M")) === JSON.stringify(["wheelUp"]));
 
+// --- stats-box line formatter (token count + model) ----------------------
+console.log("── stats line ──");
+{
+  // short name fits, right-aligned with padding, exactly `inner` wide
+  const s = formatStatsLine("1.2K tok", "gpt-4o", 24);
+  check("short name fits, padded to width", s === "1.2K tok" + " ".repeat(24 - 8 - 6) + "gpt-4o" && s.length === 24);
+  check("short name: ≥1 space between", / {2,}gpt-4o$/.test(s) || / gpt-4o$/.test(s));
+}
+{
+  // long name truncates from the END with ellipsis, leading chars preserved
+  const s = formatStatsLine("394.2K tok", "claude-sonnet-4-6", 24);
+  check("long name truncates from end (ellipsis)", s.includes("…") && s.length <= 24);
+  check("long name keeps leading chars", s.includes("claude-son") && !s.includes("onnet-4-6"));
+  check("long name: token count untouched", s.startsWith("394.2K tok"));
+}
+{
+  // exact-fit boundary: value + 1 space + model == inner exactly
+  const s = formatStatsLine("1.2K tok", "deepseek-cha", 21); // 8 + 1 + 12 = 21
+  check("exact fit: no truncation, one space", s === "1.2K tok deepseek-cha" && s.length === 21);
+}
+{
+  // one char over the exact fit forces a 1-char model trim (still ≥1 space)
+  const s = formatStatsLine("1.2K tok", "deepseek-chat", 21); // model 13, only 12 fit
+  check("one-over: model trimmed, space kept", s.length === 21 && s.startsWith("1.2K tok ") && s.endsWith("…"));
+}
+{
+  // 40-char custom model string is bounded and never overflows
+  const long = "my-org/custom-fine-tune-2026-07-08-v3-final";
+  const s = formatStatsLine("500K tok", long, 24);
+  check("40-char custom name bounded to width", s.length === 24 && s.startsWith("500K tok ") && s.endsWith("…"));
+}
+{
+  // minimum separator always present even when the model must shrink a lot
+  const s = formatStatsLine("999.9K tok", "anthropic/claude-sonnet", 18);
+  check("≥1 space even under heavy truncation", / /.test(s.slice("999.9K tok".length, "999.9K tok".length + 1)) && s.length <= 18);
+}
+{
+  // degenerate: value alone already fills the width → model dropped, value intact
+  const s = formatStatsLine("123456 tok", "gpt-4o", 8);
+  check("value wider than box: value kept (clipped), not garbled", s === "123456 t" && s.length === 8);
+}
+
+// --- stdin filter (consume mouse bytes before Ink) -----------------------
+console.log("── stdin filter ──");
+{
+  // single wheel event: no text leaks, one wheel dispatched
+  const f = createMouseFilter();
+  const r = f.feed("\x1b[<64;10;10M");
+  check("single wheel: text empty, one wheelUp", r.text === "" && JSON.stringify(r.wheels) === JSON.stringify(["wheelUp"]));
+}
+{
+  // burst of many events in one chunk
+  const f = createMouseFilter();
+  const r = f.feed("\x1b[<64;1;1M\x1b[<64;1;2M\x1b[<65;1;3M\x1b[<64;1;4M");
+  check("burst: no text, wheels in order", r.text === "" && JSON.stringify(r.wheels) === JSON.stringify(["wheelUp", "wheelUp", "wheelDown", "wheelUp"]));
+}
+{
+  // mouse event mixed with typed characters in the same chunk
+  const f = createMouseFilter();
+  const r = f.feed("a\x1b[<64;10;10Mb");
+  check('mixed "a<wheel>b": text "ab", one wheelUp', r.text === "ab" && JSON.stringify(r.wheels) === JSON.stringify(["wheelUp"]));
+}
+{
+  // sequence split across two chunks: fragment must NOT leak as text
+  const f = createMouseFilter();
+  const a = f.feed("x\x1b[<64;4"); // ends mid-sequence
+  const b = f.feed("4;12M"); // completes it
+  check("split across chunks: no fragment leaks", a.text === "x" && a.wheels.length === 0 && b.text === "" && JSON.stringify(b.wheels) === JSON.stringify(["wheelUp"]));
+}
+{
+  // split with trailing typed char after completion
+  const f = createMouseFilter();
+  const a = f.feed("\x1b[<65;1"); // partial wheel-down
+  const b = f.feed(";1M!"); // complete + a typed "!"
+  check("split then typed char: yields '!' + wheelDown", a.text === "" && b.text === "!" && JSON.stringify(b.wheels) === JSON.stringify(["wheelDown"]));
+}
+{
+  // split right at the "\x1b[" boundary (before the "<")
+  const f = createMouseFilter();
+  const a = f.feed("z\x1b["); // ESC[ at chunk end
+  const b = f.feed("<64;5;5M"); // rest of the wheel report
+  check("split at ESC[ boundary: no leak, wheel works", a.text === "z" && a.wheels.length === 0 && b.text === "" && JSON.stringify(b.wheels) === JSON.stringify(["wheelUp"]));
+}
+{
+  // clicks and drags are fully discarded (no wheels, no text)
+  const f = createMouseFilter();
+  const r = f.feed("\x1b[<0;5;5M\x1b[<0;5;5m\x1b[<32;6;6M"); // press, release, drag
+  check("click/drag/release discarded (no text, no wheels)", r.text === "" && r.wheels.length === 0);
+}
+{
+  // click mixed with typed text: keep the text, drop the click
+  const f = createMouseFilter();
+  const r = f.feed("he\x1b[<0;5;5Mllo");
+  check("click amid text: text kept, click dropped", r.text === "hello" && r.wheels.length === 0);
+}
+{
+  // a lone ESC (user pressing Esc) must pass straight through, not be buffered
+  const f = createMouseFilter();
+  const r = f.feed("\x1b");
+  check("lone ESC passes through (not buffered)", r.text === "\x1b" && r.wheels.length === 0);
+}
+{
+  // an arrow-key CSI must pass through untouched
+  const f = createMouseFilter();
+  const r = f.feed("\x1b[A");
+  check("arrow-key CSI passes through", r.text === "\x1b[A" && r.wheels.length === 0);
+}
+{
+  // plain typed text is untouched
+  const f = createMouseFilter();
+  const r = f.feed("build a todo app");
+  check("plain text untouched", r.text === "build a todo app" && r.wheels.length === 0);
+}
+
 // --- input sanitizer (mouse-noise leak) ----------------------------------
 console.log("── input sanitizer ──");
 check("keeps normal typed text", stripMouseNoise("build a todo app") === "build a todo app");
 check("strips SGR mouse report with ESC", stripMouseNoise("hi\x1b[<64;24;5Mthere") === "hithere");
 check("strips SGR mouse report without ESC (Ink stripped it)", stripMouseNoise("hi[<64;24;5Mthere") === "hithere");
 check("strips a burst of leaked wheel reports", stripMouseNoise("[<64;1;1M[<64;1;2M[<65;1;3Mx") === "x");
+check("strips a bare mouse body (lost [ prefix)", stripMouseNoise("hi<64;5;5Mthere") === "hithere");
 check("strips stray control bytes", stripMouseNoise("a\x00b\x07c") === "abc");
 check("leaves brackets in real input alone", stripMouseNoise("arr[0] = x") === "arr[0] = x");
 

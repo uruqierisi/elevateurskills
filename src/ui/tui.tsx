@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { PassThrough } from "node:stream";
 import { render, Box, Text, useInput, type Instance } from "ink";
 import TextInput from "ink-text-input";
 import type { EventBus, CheckpointDecision } from "../core/events.js";
@@ -24,9 +25,9 @@ import {
   type ScrollGeom,
 } from "./model.js";
 import { theme, TAGLINE } from "./theme.js";
-import { MOUSE_ON, MOUSE_OFF, WHEEL_LINES, parseMouseEvents } from "./mouse.js";
+import { MOUSE_ON, MOUSE_OFF, WHEEL_LINES, createMouseFilter } from "./mouse.js";
 import type { Renderer, CheckpointBudget } from "./plain.js";
-import { estimateCostUsd, formatCostUsd } from "./format.js";
+import { estimateCostUsd, formatCostUsd, formatStatsLine, truncate } from "./format.js";
 
 /**
  * Strix-style TUI: a splash, then a two-column layout — a scrollable transcript
@@ -64,6 +65,20 @@ interface Store {
   steers: string[];
   control: RunControl | null;
   onQuit: (() => void) | null;
+  /**
+   * Wheel handler registered by the Dashboard; called by the renderer's single
+   * stdin filter for each wheel notch. Kept on the store (not a stdin listener
+   * in the component) so exactly ONE consumer reads real stdin — the filter that
+   * also strips the mouse bytes before Ink sees them.
+   */
+  onWheel: ((dir: "up" | "down") => void) | null;
+  /**
+   * Render bridge registered by the Dashboard. The bus subscription and the
+   * checkpoint/confirm setters call this to push a single render on a real
+   * change, so the component does NOT have to poll the whole screen 10x/s just to
+   * notice new events — that constant full-screen redraw is a flicker source.
+   */
+  notify: (() => void) | null;
   /** When true, render a one-row layout-debug header (rows/chrome/transcript). */
   debugLayout: boolean;
 }
@@ -80,7 +95,9 @@ interface Store {
  */
 export function stripMouseNoise(v: string): string {
   return v
-    .replace(/\x1b?\[<\d+;\d+;\d+[Mm]/g, "") // SGR mouse reports
+    // SGR mouse reports, tolerating a lost `\x1b`/`[` prefix (chunk-split leak):
+    // matches `\x1b[<…M`, `[<…M`, and a bare `<…M` body.
+    .replace(/(?:\x1b\[|\[|\x1b)?<\d+;\d+;\d+[Mm]/g, "")
     .replace(/\x1b\[[\d;?]*[A-Za-z~]/g, "") // other CSI sequences (ESC-led only)
     .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, ""); // stray C0 control bytes
 }
@@ -234,22 +251,36 @@ function UsageBox({ m }: { m: TuiModel }): React.ReactElement {
   const b = m.budget;
   const tokColor = b ? budgetColor(b.tokens, b.maxTokens) : undefined;
   const callColor = b ? budgetColor(b.toolCalls, b.maxToolCalls) : undefined;
+
+  // Inner content width = box width minus the border (2) and paddingX (2). The
+  // box is given an explicit width so this is exact and every line is pre-clipped
+  // to it — Ink then never has to wrap/shrink a line, which is what used to
+  // collapse the model into the tokens line under the sidebar's height budget.
+  const inner = Math.max(1, SIDEBAR_WIDTH - 4);
+  // Model name from the run's configured model string (provider/model); show the
+  // model segment so the sidebar isn't dominated by the provider prefix.
+  const model = (m.model || "—").split("/").pop() || m.model || "—";
+  // Header: token total (left, never truncated) + model (right, ellipsis-trimmed
+  // from the end when it can't fit, always with ≥1 space between).
+  const header = formatStatsLine(`${tokensBig(m.totalTokens)} tok`, model, inner);
+
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor={theme.accent} paddingX={1}>
-      <Text color={theme.accent}>{m.model || "—"}</Text>
-      <Text>{tokensBig(m.totalTokens)} tokens</Text>
+    <Box flexDirection="column" borderStyle="round" borderColor={theme.accent} paddingX={1} width={SIDEBAR_WIDTH}>
+      <Text color={theme.accent} wrap="truncate-end">
+        {header}
+      </Text>
       {b ? (
         <>
-          <Text color={tokColor}>
-            {tokensBig(b.tokens)} / {tokensBig(b.maxTokens)} tok
+          <Text color={tokColor} wrap="truncate-end">
+            {truncate(`${tokensBig(b.tokens)} / ${tokensBig(b.maxTokens)} tok`, inner)}
           </Text>
-          <Text color={callColor}>
-            {b.toolCalls} / {b.maxToolCalls} calls
+          <Text color={callColor} wrap="truncate-end">
+            {truncate(`${b.toolCalls} / ${b.maxToolCalls} calls`, inner)}
           </Text>
         </>
       ) : null}
-      <Text dimColor>
-        ~{cost} · v{m.version}
+      <Text dimColor wrap="truncate-end">
+        {truncate(`~${cost} · v${m.version}`, inner)}
       </Text>
     </Box>
   );
@@ -296,16 +327,17 @@ function InputArea({
   active: boolean;
   width: number;
 }): React.ReactElement {
-  // Full-width bordered row pinned to the bottom. Without an explicit width the
-  // bordered Box shrank to its content ("> "), collapsing into a ~2-char box in
-  // the corner. The prompt marker is fixed-width; the TextInput flexes to fill
-  // the rest and scrolls horizontally for long input.
+  // Bordered input row pinned to the bottom. `width` is passed as cols-1 so the
+  // box's bottom-right corner never lands in the terminal's last cell: writing
+  // that cell makes the terminal scroll and Ink repaint every frame, which shows
+  // up as the input box "jittering" ~10x/s (the spinner's redraw cadence). The
+  // top layout leaves the same last column empty for exactly this reason. No
+  // flexGrow wrapper — the fixed-width border is full regardless of content, and
+  // the extra Box was one more thing to re-layout each tick.
   return (
     <Box borderStyle="round" borderColor="green" paddingX={1} width={Math.max(4, width)}>
       <Text color="green">{"> "}</Text>
-      <Box flexGrow={1}>
-        <TextInput value={value} onChange={onChange} onSubmit={onSubmit} focus={active} placeholder="" />
-      </Box>
+      <TextInput value={value} onChange={onChange} onSubmit={onSubmit} focus={active} placeholder="" />
     </Box>
   );
 }
@@ -326,14 +358,29 @@ export function Dashboard({ store }: { store: Store }): React.ReactElement {
   // once and can't close over per-render values).
   const geomRef = useRef<ScrollGeom>({ total: 0, height: 1 });
 
-  // Single render/animation loop: advances the spinner and the splash timer.
+  // Render bridge: real events (bus updates, checkpoints) push a single render
+  // instead of the component polling the whole screen. This is what lets the
+  // spinner interval below run ONLY while work is animating — an idle screen
+  // (checkpoint, finished, between stages) then redraws zero times and stays
+  // perfectly still, which is most of what "flicker" was.
+  useEffect(() => {
+    store.notify = () => setTick((t) => (t + 1) % 1_000_000);
+    return () => {
+      store.notify = null;
+    };
+  }, [store]);
+
+  // Spinner/splash animation loop. It only forces a redraw while something is
+  // actually running (or during splash) — when idle it does nothing, so the
+  // terminal isn't repainted 10x/s for a static frame.
   useEffect(() => {
     const id = setInterval(() => {
       if (store.model.phase === "splash") {
         const elapsed = Date.now() - store.model.startTs;
         if (elapsed > 1000 || store.model.blocks.length > 0) store.model = enterMain(store.model);
       }
-      setTick((t) => (t + 1) % 1_000_000);
+      const animating = store.model.phase === "splash" || orchestratorStatus(store.model.tree) === "running";
+      if (animating) setTick((t) => (t + 1) % 1_000_000);
     }, TICK_MS);
     return () => clearInterval(id);
   }, [store]);
@@ -354,12 +401,15 @@ export function Dashboard({ store }: { store: Store }): React.ReactElement {
 
   // Height budget: the transcript region is the ONLY flexible area. Every other
   // element is a KNOWN fixed row count and is truncated so it can never wrap.
-  // `chrome` is the sum of those fixed rows (recomputed as the confirm/debug rows
-  // toggle); `topHeight = rows - chrome`, so transcript + chrome == rows exactly.
-  // Anything that pushed the total past `rows` is what made the border jitter.
+  // We render into `rows - 1`, NOT the full `rows`: Ink re-emits the whole frame
+  // each render, and a frame that fills the last terminal row makes the terminal
+  // scroll and Ink's cursor math jump — that scroll, repeated every animation
+  // tick, is what made the whole TUI shudder. Leaving the bottom row empty keeps
+  // every redraw in place. `chrome + topHeight == usableRows`.
+  const usableRows = Math.max(1, rows - 1);
   const debugRows = store.debugLayout ? 1 : 0;
   const chrome = debugRows + STATUS_HEIGHT + INPUT_HEIGHT + (store.confirmReq ? CONFIRM_HEIGHT : 0);
-  const topHeight = Math.max(1, rows - chrome);
+  const topHeight = Math.max(1, usableRows - chrome);
   const leftWidth = Math.max(20, cols - SIDEBAR_WIDTH - 1);
   const contentWidth = Math.max(10, leftWidth - 2);
   // Flatten only when blocks or the wrap width change — not on every spinner
@@ -387,30 +437,19 @@ export function Dashboard({ store }: { store: Store }): React.ReactElement {
     dispatchScroll({ type: "clamp" });
   }, [maxOffset]);
 
-  // Mouse wheel: enable xterm mouse reporting on mount, dispatch wheel ticks to
-  // the same reducer, and ALWAYS disable it on unmount (ctrl-q, esc-stop, and
-  // stop() all unmount, running this cleanup). A process-level net in
-  // attachTuiRenderer covers SIGINT/crash where cleanup may not run.
+  // Register the wheel handler for the renderer's stdin filter (the single
+  // consumer of real stdin — see attachTuiRenderer). The filter strips the mouse
+  // bytes before Ink sees them, so nothing leaks into the input box.
   useEffect(() => {
-    const stdout = process.stdout;
-    const stdin = process.stdin;
-    if (!stdout.isTTY) return; // no-op under tests / pipes
-    stdout.write(MOUSE_ON);
-    const onData = (buf: Buffer | string): void => {
-      for (const ev of parseMouseEvents(buf.toString())) {
-        dispatchScroll(ev === "wheelUp" ? { type: "up", amount: WHEEL_LINES } : { type: "down", amount: WHEEL_LINES });
-      }
-    };
-    stdin.on("data", onData);
+    store.onWheel = (dir) =>
+      dispatchScroll(dir === "up" ? { type: "up", amount: WHEEL_LINES } : { type: "down", amount: WHEEL_LINES });
     return () => {
-      stdin.off("data", onData);
-      try {
-        stdout.write(MOUSE_OFF);
-      } catch {
-        /* stream may be gone during teardown */
-      }
+      store.onWheel = null;
     };
-  }, []);
+    // dispatchScroll reads geomRef.current (a ref) and a stable setState, so a
+    // once-registered handler always sees current geometry.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [store]);
 
   const vp = computeViewport(lines, topHeight, Math.min(scroll.offset, maxOffset));
 
@@ -466,10 +505,10 @@ export function Dashboard({ store }: { store: Store }): React.ReactElement {
 
   const inputActive = !m.checkpoint && !store.confirmReq;
   // The rendered line total: header + transcript rows + confirm + status + input.
-  // This MUST equal rows; --debug-layout surfaces the numbers to confirm it.
+  // This MUST equal usableRows (rows-1); --debug-layout surfaces the numbers.
   const renderedRows = chrome + topHeight;
   return (
-    <Box flexDirection="column" width={cols} height={rows} overflow="hidden">
+    <Box flexDirection="column" width={cols} height={usableRows} overflow="hidden">
       {store.debugLayout ? (
         <Box height={debugRows} flexShrink={0}>
           <Text color="yellow" wrap="truncate-end">
@@ -506,7 +545,7 @@ export function Dashboard({ store }: { store: Store }): React.ReactElement {
           value={input}
           onChange={(v) => setInput(stripMouseNoise(v))}
           active={inputActive}
-          width={cols}
+          width={Math.max(4, cols - 1)}
           onSubmit={(v) => {
             const text = v.trim();
             if (text) {
@@ -545,6 +584,54 @@ function guardConsole(): () => void {
   };
 }
 
+/** Minimal shape of a TTY stdin Ink can drive (beyond EventEmitter). */
+interface TtyIn extends NodeJS.EventEmitter {
+  isTTY?: boolean;
+  setRawMode?(mode: boolean): void;
+  ref?(): void;
+  unref?(): void;
+  resume?(): void;
+  pause?(): void;
+}
+
+/**
+ * Build the input stream handed to Ink. The real terminal stdin is the SINGLE
+ * consumer: a `data` listener runs every chunk through the mouse filter,
+ * dispatches wheel notches via `onWheel`, and pushes only the non-mouse bytes
+ * into a PassThrough that Ink reads. Ink therefore never sees mouse reports, so
+ * nothing leaks into the input box. TTY control methods Ink calls
+ * (`setRawMode`, `ref`, `unref`) are forwarded to the real stdin so raw mode and
+ * process refcounting still work. Returns null when stdin is not a TTY (tests /
+ * pipes) — the caller then lets Ink use the default stdin.
+ */
+function createFilteredStdin(onWheel: (dir: "up" | "down") => void): { stdin: PassThrough; dispose: () => void } | null {
+  const real = process.stdin as unknown as TtyIn;
+  if (!real.isTTY) return null;
+
+  const proxy = new PassThrough() as PassThrough & TtyIn;
+  proxy.isTTY = true;
+  proxy.setRawMode = (mode: boolean) => real.setRawMode?.(mode);
+  proxy.ref = () => real.ref?.();
+  proxy.unref = () => real.unref?.();
+
+  const filter = createMouseFilter();
+  const onData = (buf: Buffer | string): void => {
+    const { text, wheels } = filter.feed(buf.toString("utf8" as BufferEncoding));
+    for (const w of wheels) onWheel(w === "wheelUp" ? "up" : "down");
+    if (text) proxy.push(Buffer.from(text, "utf8"));
+  };
+  real.on("data", onData as (...a: unknown[]) => void);
+  real.resume?.();
+
+  return {
+    stdin: proxy,
+    dispose: () => {
+      real.off("data", onData as (...a: unknown[]) => void);
+      proxy.end();
+    },
+  };
+}
+
 export function attachTuiRenderer(bus: EventBus, opts: { model?: string; control?: RunControl; debugLayout?: boolean } = {}): Renderer {
   const store: Store = {
     model: initModel(packageVersion(), Date.now()),
@@ -553,6 +640,8 @@ export function attachTuiRenderer(bus: EventBus, opts: { model?: string; control
     steers: [],
     control: opts.control ?? null,
     onQuit: null,
+    onWheel: null,
+    notify: null,
     debugLayout: opts.debugLayout ?? false,
   };
 
@@ -561,14 +650,25 @@ export function attachTuiRenderer(bus: EventBus, opts: { model?: string; control
     if (store.model.phase === "splash" && (e.type === "stage:start" || e.type === "stage:progress")) {
       store.model = enterMain(store.model);
     }
+    // Push a render for this real change (the component no longer polls).
+    store.notify?.();
   });
+
+  // Single stdin consumer: filter mouse bytes out before Ink, dispatch wheels to
+  // the store's handler. Null on a non-TTY (tests) → Ink uses default stdin.
+  const filtered = createFilteredStdin((dir) => store.onWheel?.(dir));
+  if (filtered && process.stdout.isTTY) process.stdout.write(MOUSE_ON);
 
   const restoreConsole = guardConsole();
   let instance: Instance | null;
   try {
-    instance = render(<Dashboard store={store} />, { exitOnCtrlC: false });
+    instance = render(<Dashboard store={store} />, {
+      exitOnCtrlC: false,
+      ...(filtered ? { stdin: filtered.stdin as unknown as NodeJS.ReadStream } : {}),
+    });
   } catch (err) {
     // Mount failed — restore console so the plain-renderer fallback can print.
+    filtered?.dispose();
     restoreConsole();
     unsubscribe();
     throw err;
@@ -595,11 +695,13 @@ export function attachTuiRenderer(bus: EventBus, opts: { model?: string; control
       return new Promise((resolve) => {
         store.model = { ...store.model, checkpoint: { stage, artifactPaths, budget } };
         store.checkpointResolver = resolve;
+        store.notify?.(); // idle screen: force the checkpoint prompt to appear
       });
     },
     confirm(question: string): Promise<boolean> {
       return new Promise((resolve) => {
         store.confirmReq = { question, resolve };
+        store.notify?.(); // idle screen: force the confirm modal to appear
       });
     },
     drainSteers(): string[] {
@@ -614,6 +716,7 @@ export function attachTuiRenderer(bus: EventBus, opts: { model?: string; control
         instance = null;
       }
       restoreMouse();
+      filtered?.dispose();
       process.off("exit", restoreMouse);
       process.off("SIGINT", restoreMouse);
       restoreConsole();
