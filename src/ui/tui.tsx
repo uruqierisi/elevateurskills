@@ -70,6 +70,21 @@ interface Store {
 
 // --- small helpers --------------------------------------------------------
 
+/**
+ * Strip terminal noise that can leak into the steering input while mouse
+ * reporting is on. Ink can hand the raw mouse-report bytes to the focused
+ * text input, where they show up as garbage like `[<64;24;5M`. We consume the
+ * wheel via our own stdin listener, so anything that reaches the box is noise:
+ * remove SGR mouse reports (with or without the leading ESC), other ESC-led CSI
+ * sequences, and stray control bytes — leaving only what the user actually typed.
+ */
+export function stripMouseNoise(v: string): string {
+  return v
+    .replace(/\x1b?\[<\d+;\d+;\d+[Mm]/g, "") // SGR mouse reports
+    .replace(/\x1b\[[\d;?]*[A-Za-z~]/g, "") // other CSI sequences (ESC-led only)
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, ""); // stray C0 control bytes
+}
+
 function termSize(): { cols: number; rows: number } {
   return { cols: process.stdout.columns || 80, rows: process.stdout.rows || 24 };
 }
@@ -489,7 +504,7 @@ export function Dashboard({ store }: { store: Store }): React.ReactElement {
       <Box height={INPUT_HEIGHT} flexShrink={0} width={cols}>
         <InputArea
           value={input}
-          onChange={setInput}
+          onChange={(v) => setInput(stripMouseNoise(v))}
           active={inputActive}
           width={cols}
           onSubmit={(v) => {

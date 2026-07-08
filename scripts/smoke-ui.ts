@@ -16,7 +16,7 @@ import {
 } from "../src/ui/model.js";
 import { parseMouseEvents } from "../src/ui/mouse.js";
 import { theme } from "../src/ui/theme.js";
-import { Dashboard } from "../src/ui/tui.js";
+import { Dashboard, stripMouseNoise } from "../src/ui/tui.js";
 
 /**
  * Unit checks for the scroll/follow reducer, the incremental flatten cache, the
@@ -52,6 +52,15 @@ check(
   JSON.stringify(parseMouseEvents("\x1b[<64;1;1M\x1b[<65;2;2M\x1b[<64;3;3M")) === JSON.stringify(["wheelUp", "wheelDown", "wheelUp"]),
 );
 check("stateless across calls (no leftover regex index)", JSON.stringify(parseMouseEvents("\x1b[<64;1;1M")) === JSON.stringify(["wheelUp"]));
+
+// --- input sanitizer (mouse-noise leak) ----------------------------------
+console.log("── input sanitizer ──");
+check("keeps normal typed text", stripMouseNoise("build a todo app") === "build a todo app");
+check("strips SGR mouse report with ESC", stripMouseNoise("hi\x1b[<64;24;5Mthere") === "hithere");
+check("strips SGR mouse report without ESC (Ink stripped it)", stripMouseNoise("hi[<64;24;5Mthere") === "hithere");
+check("strips a burst of leaked wheel reports", stripMouseNoise("[<64;1;1M[<64;1;2M[<65;1;3Mx") === "x");
+check("strips stray control bytes", stripMouseNoise("a\x00b\x07c") === "abc");
+check("leaves brackets in real input alone", stripMouseNoise("arr[0] = x") === "arr[0] = x");
 
 // --- scroll / follow reducer ---------------------------------------------
 console.log("── scroll reducer ──");
