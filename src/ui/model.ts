@@ -317,12 +317,175 @@ export function blockToLines(block: TranscriptBlock, width: number, accent: stri
   }
 }
 
+/** True for block kinds that get a trailing blank line for visual spacing. */
+function spacedKind(kind: BlockKind): boolean {
+  return kind === "thinking" || kind === "todo" || kind === "handoff";
+}
+
 /** Flatten all blocks to a single styled-line list. */
 export function transcriptLines(blocks: TranscriptBlock[], width: number, accent: string): StyledLine[] {
   const out: StyledLine[] = [];
   for (const b of blocks) {
     for (const line of blockToLines(b, width, accent)) out.push(line);
-    if (b.kind === "thinking" || b.kind === "todo" || b.kind === "handoff") out.push({ text: "" });
+    if (spacedKind(b.kind)) out.push({ text: "" });
   }
   return out;
+}
+
+// --- incremental flattening cache -----------------------------------------
+
+/**
+ * Per-block flattened-line cache. Re-flattening every block on every render (the
+ * render loop ticks ~10x/s for the spinner, independent of new content) is pure
+ * waste: a block's lines only change when its width changes or its content
+ * changes (todo items mutate in place; everything else is append-only). The
+ * cache keys each block by id and only recomputes when width or a content
+ * signature changes, so a new line costs O(1) flatten work, not O(buffer).
+ */
+export interface LineCache {
+  map: Map<number, { width: number; sig: string; lines: StyledLine[] }>;
+}
+
+export function createLineCache(): LineCache {
+  return { map: new Map() };
+}
+
+/** Content signature used to invalidate a cached block when it changes. */
+function blockSig(b: TranscriptBlock): string {
+  if (b.kind === "todo") {
+    return "todo:" + (b.items ?? []).map((i) => (i.done ? "1" : "0") + i.text).join("");
+  }
+  return `${b.kind}${b.stage ?? ""}${b.text ?? ""}${b.tool ?? ""}${b.args ?? ""}${b.passed ?? ""}${b.detail ?? ""}`;
+}
+
+/**
+ * Flatten all blocks using (and updating) a cache. Equivalent output to
+ * {@link transcriptLines} but only recomputes blocks whose width or content
+ * changed; blocks that dropped out of the buffer are evicted from the cache.
+ */
+export function flattenBlocksCached(cache: LineCache, blocks: TranscriptBlock[], width: number, accent: string): StyledLine[] {
+  const out: StyledLine[] = [];
+  const seen = new Set<number>();
+  for (const b of blocks) {
+    seen.add(b.id);
+    const sig = blockSig(b);
+    const hit = cache.map.get(b.id);
+    let lines: StyledLine[];
+    if (hit && hit.width === width && hit.sig === sig) {
+      lines = hit.lines;
+    } else {
+      lines = blockToLines(b, width, accent);
+      if (spacedKind(b.kind)) lines = [...lines, { text: "" }];
+      cache.map.set(b.id, { width, sig, lines });
+    }
+    for (const ln of lines) out.push(ln);
+  }
+  // Evict blocks no longer in the buffer (it is capped/sliced) so the cache
+  // never outgrows the transcript.
+  if (cache.map.size > blocks.length) {
+    for (const id of cache.map.keys()) if (!seen.has(id)) cache.map.delete(id);
+  }
+  return out;
+}
+
+// --- scroll viewport ------------------------------------------------------
+
+export interface Viewport {
+  visible: StyledLine[];
+  viewport: number;
+  start: number; // index of first visible line in the full buffer
+  total: number; // total buffered lines
+  above: number; // lines hidden above the viewport
+  below: number; // lines hidden below the viewport
+}
+
+/**
+ * Slice the flat line buffer to the window the viewport shows. `scrollOffset` is
+ * measured in lines up from the bottom: 0 pins to the newest line; the maximum
+ * offset shows the very top. Returns the padded visible slice plus the counts of
+ * hidden lines above/below for the scroll indicator.
+ */
+export function computeViewport(lines: StyledLine[], height: number, scrollOffset: number): Viewport {
+  const viewport = Math.max(1, height);
+  const total = lines.length;
+  const maxStart = Math.max(0, total - viewport);
+  const clampedOffset = Math.max(0, Math.min(maxStart, scrollOffset));
+  const start = maxStart - clampedOffset;
+  const visible = lines.slice(start, start + viewport);
+  while (visible.length < viewport) visible.push({ text: "" });
+  const above = start;
+  const below = Math.max(0, total - (start + viewport));
+  return { visible, viewport, start, total, above, below };
+}
+
+// --- scroll / follow-mode reducer -----------------------------------------
+
+/**
+ * Viewport scroll state, kept as a tiny pure reducer so PgUp/PgDn/Home/End and
+ * mouse-wheel ticks all flow through one testable place.
+ *
+ * `offset` is lines scrolled up from the bottom (0 = newest line at the bottom).
+ * `follow` is auto-scroll: while true the viewport stays pinned to the bottom as
+ * content grows. Invariant maintained by {@link scrollReduce}: `follow` is true
+ * iff `offset === 0` — reaching the bottom re-enables follow; any upward
+ * movement disengages it, so new lines never yank a scrolled-up reader down.
+ */
+export interface ScrollState {
+  offset: number;
+  follow: boolean;
+}
+
+export const initialScroll: ScrollState = { offset: 0, follow: true };
+
+/** Viewport geometry the scroll reducer needs to clamp against. */
+export interface ScrollGeom {
+  total: number; // total flattened lines
+  height: number; // viewport height in rows
+}
+
+export type ScrollAction =
+  | { type: "up"; amount: number } // wheel/line up
+  | { type: "down"; amount: number } // wheel/line down
+  | { type: "pageUp" }
+  | { type: "pageDown" }
+  | { type: "top" } // Home
+  | { type: "bottom" } // End — re-pins follow
+  | { type: "grew"; amount: number } // new lines appended
+  | { type: "clamp" }; // viewport/buffer size changed (resize / rewrap)
+
+function maxOffsetFor(g: ScrollGeom): number {
+  return Math.max(0, g.total - Math.max(1, g.height));
+}
+
+/** Normalise so `follow === (offset === 0)` always holds. */
+function normScroll(offset: number, maxOffset: number): ScrollState {
+  const clamped = Math.max(0, Math.min(maxOffset, offset));
+  return clamped <= 0 ? { offset: 0, follow: true } : { offset: clamped, follow: false };
+}
+
+export function scrollReduce(s: ScrollState, action: ScrollAction, g: ScrollGeom): ScrollState {
+  const maxOffset = maxOffsetFor(g);
+  const page = Math.max(1, Math.max(1, g.height) - 1);
+  switch (action.type) {
+    case "up":
+      return normScroll(s.offset + Math.max(0, action.amount), maxOffset);
+    case "pageUp":
+      return normScroll(s.offset + page, maxOffset);
+    case "down":
+      return normScroll(s.offset - Math.max(0, action.amount), maxOffset);
+    case "pageDown":
+      return normScroll(s.offset - page, maxOffset);
+    case "top":
+      return normScroll(maxOffset, maxOffset);
+    case "bottom":
+      return { offset: 0, follow: true };
+    case "grew":
+      // Following: stay pinned to the bottom. Otherwise hold the viewed lines in
+      // place — the bottom moved down by `amount`, so add it to the up-offset.
+      return s.follow ? { offset: 0, follow: true } : normScroll(s.offset + Math.max(0, action.amount), maxOffset);
+    case "clamp":
+      return s.follow ? { offset: 0, follow: true } : normScroll(s.offset, maxOffset);
+    default:
+      return s;
+  }
 }

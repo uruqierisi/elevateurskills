@@ -7,6 +7,8 @@ import {
   DockerPostgres,
   LocalSandbox,
   SandboxInfraError,
+  checkSandboxConnectivity,
+  sandboxInternetEnabled,
   type Sandbox,
   type SandboxOptions,
 } from "./sandbox.js";
@@ -290,6 +292,21 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
         sandbox = activated.sandbox;
         postgres = activated.postgres;
         sandboxActivated = true;
+
+        // One-time outbound-connectivity probe before the builders spend tokens.
+        // Non-fatal: agents (repository pattern, in-memory tests, Docker-time
+        // Prisma generation) can still proceed offline, but a clear early warning
+        // stops them from burning budget retrying downloads that can't succeed.
+        if (sandbox.kind === "docker" && sandboxInternetEnabled()) {
+          const conn = await checkSandboxConnectivity(sandbox);
+          state.appendLog("orchestrator", `[sandbox] connectivity: ${conn.detail}`);
+          bus.emit({
+            type: "stage:progress",
+            stage: stageName,
+            tool: "sandbox",
+            summary: `${conn.ok ? "connectivity ok" : "WARNING: no internet"} · ${conn.detail}`,
+          });
+        }
       }
 
       let decision: CheckpointDecision = "continue";

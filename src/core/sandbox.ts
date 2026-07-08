@@ -271,12 +271,35 @@ export interface DockerLimits {
 
 const DEFAULT_DOCKER_LIMITS: DockerLimits = { memory: "2g", cpus: "2", pids: "512" };
 
+/**
+ * Public DNS resolvers injected as a fallback when outbound internet is enabled.
+ * This is the fix for the common case (notably WSL2, and any host whose
+ * /etc/resolv.conf points at a loopback stub resolver like 127.0.0.53) where
+ * Docker copies a nameserver into the container that is unreachable from inside
+ * it, so DNS silently fails and every `npm install` / `prisma generate` hangs on
+ * name resolution even though the bridge itself has a working internet gateway.
+ */
+const DEFAULT_SANDBOX_DNS = ["8.8.8.8", "1.1.1.1"];
+
 export interface DockerSandboxOptions {
   limits?: DockerLimits;
   /** Docker network to attach each container to (for a Postgres sidecar). */
   network?: string;
   /** Env merged UNDER every command's own env (e.g. a default DATABASE_URL). */
   defaultEnv?: Record<string, string>;
+  /**
+   * Whether sandbox containers get outbound internet. Default true. When false
+   * and no sidecar network is attached, the container runs with `--network none`
+   * (fully isolated); when a sidecar network IS attached it is preserved so the
+   * database stays reachable.
+   */
+  internet?: boolean;
+  /**
+   * DNS servers to set on the container (`--dns`). Only applied when internet is
+   * enabled. Empty list => let Docker supply DNS (host resolv.conf / embedded
+   * resolver). Defaults to {@link DEFAULT_SANDBOX_DNS}.
+   */
+  dns?: string[];
 }
 
 export class DockerSandbox implements Sandbox {
@@ -286,6 +309,8 @@ export class DockerSandbox implements Sandbox {
   private readonly limits: DockerLimits;
   private readonly network?: string;
   private readonly defaultEnv: Record<string, string>;
+  private readonly internet: boolean;
+  private readonly dns: string[];
 
   constructor(root: string, image: string, options: DockerSandboxOptions = {}) {
     this.root = resolve(root);
@@ -294,6 +319,8 @@ export class DockerSandbox implements Sandbox {
     this.limits = options.limits ?? DEFAULT_DOCKER_LIMITS;
     this.network = options.network;
     this.defaultEnv = options.defaultEnv ?? {};
+    this.internet = options.internet ?? true;
+    this.dns = options.dns ?? DEFAULT_SANDBOX_DNS;
   }
 
   resolve(relPath: string): string {
@@ -305,8 +332,17 @@ export class DockerSandbox implements Sandbox {
    * only mount, all Linux capabilities are dropped, privilege escalation is
    * blocked, memory/CPU/pids are capped, and the host env is never passed —
    * only project vars (with secret-looking names filtered) are injected, so the
-   * LLM provider key can never reach project code. Networking uses the default
-   * bridge (outbound for npm/prisma) — never the host network namespace.
+   * LLM provider key can never reach project code.
+   *
+   * Networking (never the host network namespace):
+   *   - A Postgres sidecar network, when present, is always joined so the DB is
+   *     reachable by container name via Docker's embedded DNS.
+   *   - Otherwise, with internet enabled, the default bridge NATs outbound.
+   *   - With internet disabled and no sidecar, `--network none` fully isolates.
+   *   - When internet is enabled, explicit `--dns` servers are injected as a
+   *     fallback for hosts (WSL2, stub-resolver setups) whose DNS Docker would
+   *     otherwise copy in broken. On a sidecar network these become the embedded
+   *     resolver's upstream, so container-name resolution keeps working.
    */
   buildRunArgs(command: string, opts: ExecOptions, containerName: string): string[] {
     const workdir = opts.cwd ? `/workspace/${opts.cwd.replace(/^\/+/, "")}` : "/workspace";
@@ -318,12 +354,23 @@ export class DockerSandbox implements Sandbox {
       if (isSecretName(k)) continue;
       envArgs.push("-e", `${k}=${v}`);
     }
-    // Attach to the run's user-defined network when a Postgres sidecar is up, so
-    // the container can reach it by container name via Docker's embedded DNS.
-    const networkArgs = this.network ? ["--network", this.network] : [];
+
+    const networkArgs: string[] = [];
+    if (this.network) {
+      networkArgs.push("--network", this.network);
+    } else if (!this.internet) {
+      networkArgs.push("--network", "none");
+    }
+    const dnsArgs: string[] = [];
+    if (this.internet) {
+      for (const server of this.dns) dnsArgs.push("--dns", server);
+    }
+
     return [
       "run",
       "--rm",
+      "--user",
+      `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`,
       "--name",
       containerName,
       "--cap-drop",
@@ -337,6 +384,7 @@ export class DockerSandbox implements Sandbox {
       "--pids-limit",
       this.limits.pids,
       ...networkArgs,
+      ...dnsArgs,
       "-v",
       `${this.root}:/workspace`,
       "-w",
@@ -430,6 +478,32 @@ export interface SandboxOptions {
   network?: string;
   /** Env merged UNDER every command (e.g. a working DATABASE_URL for Prisma). */
   defaultEnv?: Record<string, string>;
+  /** Outbound internet for docker containers. Default: {@link sandboxInternetEnabled}. */
+  internet?: boolean;
+  /** DNS servers for docker containers. Default: {@link sandboxDnsServers}. */
+  dns?: string[];
+}
+
+/**
+ * Whether sandbox containers should have outbound internet. Controlled by
+ * `SANDBOX_INTERNET`; enabled by default. `false`/`0`/`no`/`off` disable it.
+ */
+export function sandboxInternetEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = (env.SANDBOX_INTERNET ?? "").trim().toLowerCase();
+  if (v === "") return true;
+  return !["false", "0", "no", "off"].includes(v);
+}
+
+/**
+ * DNS servers to inject into sandbox containers. Controlled by `SANDBOX_DNS`
+ * (comma-separated). Unset/empty => the default public fallback resolvers;
+ * `none`/`off` => inject nothing and rely on Docker's own DNS.
+ */
+export function sandboxDnsServers(env: NodeJS.ProcessEnv = process.env): string[] {
+  const raw = (env.SANDBOX_DNS ?? "").trim();
+  if (raw === "") return [...DEFAULT_SANDBOX_DNS];
+  if (["none", "off"].includes(raw.toLowerCase())) return [];
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
 }
 
 /**
@@ -661,6 +735,55 @@ export function createSandbox(root: string, options: SandboxOptions = {}): Sandb
     ? new DockerSandbox(root, options.image ?? sandboxImageTag(), {
         network: options.network,
         defaultEnv,
+        internet: options.internet ?? sandboxInternetEnabled(),
+        dns: options.dns ?? sandboxDnsServers(),
       })
     : new LocalSandbox(root, defaultEnv);
+}
+
+export interface ConnectivityResult {
+  /** True when outbound HTTPS works (npm registry or general HTTPS reachable). */
+  ok: boolean;
+  dns: boolean;
+  https: boolean;
+  npm: boolean;
+  /** Human-readable summary for logs / operator display. */
+  detail: string;
+}
+
+/**
+ * Best-effort outbound-connectivity probe, run inside the sandbox before the
+ * expensive builder agents start. Checks DNS resolution, npm-registry
+ * reachability, and general HTTPS egress in a single throwaway container. Never
+ * throws — a sandbox infra error or any failure resolves to `ok: false` so the
+ * caller can warn clearly instead of letting agents burn tokens retrying
+ * downloads that can never succeed.
+ */
+export async function checkSandboxConnectivity(sandbox: Sandbox): Promise<ConnectivityResult> {
+  // `&& … || …` makes each line exit 0 regardless, so one exec reports all three.
+  const script = [
+    "getent hosts registry.npmjs.org >/dev/null 2>&1 && echo DNS_OK || echo DNS_FAIL",
+    "curl -fsS --max-time 12 https://registry.npmjs.org >/dev/null 2>&1 && echo NPM_OK || echo NPM_FAIL",
+    "curl -fsS --max-time 12 https://www.google.com >/dev/null 2>&1 && echo HTTPS_OK || echo HTTPS_FAIL",
+  ].join("; ");
+
+  let out = "";
+  try {
+    const r = await sandbox.exec(script, { timeoutMs: 45_000 });
+    out = `${r.stdout}\n${r.stderr}`;
+  } catch (err) {
+    const why = err instanceof Error ? err.message : String(err);
+    return { ok: false, dns: false, https: false, npm: false, detail: `connectivity probe could not run: ${why}` };
+  }
+
+  const dns = out.includes("DNS_OK");
+  const npm = out.includes("NPM_OK");
+  const https = out.includes("HTTPS_OK");
+  const ok = npm || https;
+  const parts = `dns=${dns ? "ok" : "fail"}, npm=${npm ? "ok" : "fail"}, https=${https ? "ok" : "fail"}`;
+  const detail = ok
+    ? `outbound internet ok (${parts})`
+    : `NO outbound internet (${parts}). npm installs and Prisma engine downloads will fail — ` +
+      `check Docker DNS/networking (SANDBOX_DNS) before spending agent time.`;
+  return { ok, dns, https, npm, detail };
 }

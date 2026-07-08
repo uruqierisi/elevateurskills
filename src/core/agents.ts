@@ -61,17 +61,61 @@ function fail(detail: string): GateResult {
   return { pass: false, detail };
 }
 
+interface Step {
+  label: string;
+  command: string;
+  timeoutMs?: number;
+  env?: Record<string, string>;
+  /**
+   * When true, a non-zero exit whose output looks like a Prisma engine
+   * download / network problem (not a schema error) is logged and skipped
+   * instead of failing the gate. This stops an offline sandbox from burning a
+   * full agent re-spawn on `prisma generate`/`validate` when the engines simply
+   * couldn't be fetched — final generation happens during the Docker build.
+   */
+  softFailOnPrismaEngine?: boolean;
+}
+
+/**
+ * Signatures of a Prisma failure that is an engine-download / network problem
+ * rather than a real schema or code error. A schema error (bad model, unknown
+ * field, missing generator) must still fail the gate, so we match narrowly on
+ * fetch/download/connectivity phrases only.
+ */
+const PRISMA_ENGINE_NETWORK_SIGNATURES = [
+  "failed to fetch the engine",
+  "failed to fetch sha256",
+  "error: request to https://binaries.prisma.io",
+  "prisma cannot download",
+  "downloading prisma engines",
+  "getaddrinfo enotfound",
+  "econnreset",
+  "etimedout",
+  "enetunreach",
+  "unable to get local issuer certificate",
+  "socket hang up",
+  "network",
+];
+
+function looksLikePrismaEngineNetworkFailure(output: string): boolean {
+  const lower = output.toLowerCase();
+  return PRISMA_ENGINE_NETWORK_SIGNATURES.some((s) => lower.includes(s));
+}
+
 /** Run a sequence of shell steps; stop at the first non-zero exit. */
-async function runSteps(
-  ctx: GateContext,
-  cwd: string,
-  steps: Array<{ label: string; command: string; timeoutMs?: number; env?: Record<string, string> }>,
-): Promise<GateResult> {
+async function runSteps(ctx: GateContext, cwd: string, steps: Step[]): Promise<GateResult> {
   for (const step of steps) {
     ctx.log(`gate: ${step.label} (${step.command})`);
     const r = await ctx.sandbox.exec(step.command, { cwd, timeoutMs: step.timeoutMs ?? 300_000, env: step.env });
     if (r.exitCode !== 0) {
       const out = `${r.stdout}\n${r.stderr}`.trim().slice(-4000);
+      if (step.softFailOnPrismaEngine && looksLikePrismaEngineNetworkFailure(out) && !r.timedOut) {
+        ctx.log(
+          `gate: "${step.label}" hit a Prisma engine download/network problem — treating as an environment ` +
+            `limitation (Docker build regenerates it), not a code failure. Continuing.`,
+        );
+        continue;
+      }
       return fail(`Step "${step.label}" failed (exit ${r.exitCode})${r.timedOut ? " [timeout]" : ""}:\n${out}`);
     }
   }
@@ -159,19 +203,67 @@ function safeArch(state: RunState): Record<string, unknown> {
 
 // --- builder gates --------------------------------------------------------
 
+/** Read a workspace-relative file; null if absent or unreadable. */
+function readWs(sandbox: Sandbox, rel: string): string | null {
+  try {
+    const abs = sandbox.resolve(rel);
+    return existsSync(abs) ? readFileSync(abs, "utf8") : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Deterministic Prisma/Docker config checks the sandbox steps CANNOT catch: the
+ * gate builds + runs the in-memory tests, so it never loads a real query engine
+ * or builds the Docker image. These static assertions turn "the agent should
+ * follow the role" into "a non-conforming generation fails its gate and retries"
+ * — the invariants that repeatedly broke real deployments.
+ */
+function checkBackendConfig(sandbox: Sandbox): string[] {
+  const problems: string[] = [];
+  const schema = readWs(sandbox, "backend/prisma/schema.prisma");
+  if (schema) {
+    const bt = schema.match(/binaryTargets\s*=\s*\[([^\]]*)\]/);
+    if (!bt) {
+      problems.push('backend/prisma/schema.prisma: generator client is missing `binaryTargets`');
+    } else {
+      for (const t of ["debian-openssl-3.0.x", "linux-musl-openssl-3.0.x"]) {
+        if (!bt[1].includes(t)) {
+          problems.push(`backend/prisma/schema.prisma: binaryTargets must include "${t}" (native alone mis-detects OpenSSL on bookworm-slim → runtime "could not locate the Query Engine")`);
+        }
+      }
+    }
+    // A Dockerfile that does `COPY . .` will clobber the generated client with
+    // the host node_modules unless a .dockerignore excludes it.
+    const di = readWs(sandbox, "backend/.dockerignore");
+    if (di === null) {
+      problems.push("backend/.dockerignore is missing — COPY . . would overwrite the generated Prisma client with host node_modules (runtime: '@prisma/client did not initialize yet')");
+    } else if (!/(^|\n)\s*node_modules\s*(\/)?\s*(\n|$)/.test(di)) {
+      problems.push("backend/.dockerignore must list node_modules");
+    }
+  }
+  return problems;
+}
+
 // prisma generate/validate only parse the schema and read env(); they never
 // open a connection. A working DATABASE_URL is already injected into every
 // sandbox command (the sidecar's real URL, or the placeholder — see
 // createSandbox), so the gate no longer has to supply one. The test step forces
 // NODE_ENV=test, which selects the in-memory repository per the backend role.
-const backendGate: Gate = (ctx) =>
-  runSteps(ctx, "backend", [
+const backendGate: Gate = async (ctx) => {
+  const steps = await runSteps(ctx, "backend", [
     { label: "install", command: "npm install" },
-    { label: "prisma generate", command: "npx prisma generate" },
-    { label: "prisma validate", command: "npx prisma validate" },
+    { label: "prisma generate", command: "npx prisma generate", softFailOnPrismaEngine: true },
+    { label: "prisma validate", command: "npx prisma validate", softFailOnPrismaEngine: true },
     { label: "build", command: "npm run build" },
     { label: "test", command: "npm test", env: { NODE_ENV: "test" } },
   ]);
+  if (!steps.pass) return steps;
+  const problems = checkBackendConfig(ctx.sandbox);
+  if (problems.length) return fail(`Backend config check failed (fix and retry):\n- ${problems.join("\n- ")}`);
+  return ok("Backend gate passed: build, tests, and Prisma/Docker config checks.");
+};
 
 /** Candidate directories (workspace-relative) that may hold a frontend project. */
 function findBuildDir(sandbox: Sandbox, state: RunState): string | null {
@@ -272,6 +364,25 @@ const reviewerGate: Gate = (ctx) => {
   return staticSiteGate(ctx);
 };
 
+/** Deterministic docker-compose.yml checks: the collisions that broke real runs. */
+function checkComposeConfig(sandbox: Sandbox): string[] {
+  const problems: string[] = [];
+  const compose = readWs(sandbox, "docker-compose.yml");
+  if (!compose) return problems;
+  // A top-level `name:` (column 0) gives each generated project its own
+  // container/volume namespace; without it Compose defaults to the workspace
+  // dir name and projects collide (stale `pgdata`, orphan containers).
+  if (!/^name\s*:/m.test(compose)) {
+    problems.push("docker-compose.yml needs a top-level `name:` (unique project name) so containers/volumes don't collide with other generated projects");
+  }
+  // Publishing the DB on host 5432 collides with any other Postgres on the
+  // machine (system install or an earlier generated project).
+  if (/["']?\b5432\s*:\s*5432\b["']?/.test(compose)) {
+    problems.push("docker-compose.yml must not publish the database on host port 5432 — remove the postgres `ports:` mapping (the backend reaches it over the Compose network as postgres:5432)");
+  }
+  return problems;
+}
+
 const devopsGate: Gate = async ({ sandbox }) => {
   const required = [
     "backend/Dockerfile",
@@ -281,7 +392,9 @@ const devopsGate: Gate = async ({ sandbox }) => {
   ];
   const missing = required.filter((f) => !existsSync(sandbox.resolve(f)));
   if (missing.length) return fail(`Missing deploy files: ${missing.join(", ")}`);
-  return ok("Deployment files present.");
+  const problems = checkComposeConfig(sandbox);
+  if (problems.length) return fail(`Deploy config check failed (fix and retry):\n- ${problems.join("\n- ")}`);
+  return ok("Deployment files present and Compose config checks passed.");
 };
 
 // --- task builders --------------------------------------------------------

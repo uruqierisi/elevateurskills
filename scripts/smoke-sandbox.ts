@@ -110,6 +110,7 @@ function main() {
     ["mounts only the workspace", dargs.filter((a) => a === "-v").length === 1],
     ["never uses host network", !joined.includes("--network host")],
     ["joins the sidecar network", joined.includes("--network eus-net-r1")],
+    ["injects fallback DNS by default", joined.includes("--dns 8.8.8.8") && joined.includes("--dns 1.1.1.1")],
     ["injects sidecar DATABASE_URL default", joined.includes("DATABASE_URL=postgresql://postgres:test@eus-pg-r1:5432/test")],
     ["injects per-command NODE_ENV", joined.includes("NODE_ENV=test")],
     ["never injects LLM_API_KEY", !joined.includes("LLM_API_KEY")],
@@ -121,6 +122,36 @@ function main() {
   });
   const overrideArgs = dsb2.buildRunArgs("x", { env: { DATABASE_URL: "postgresql://override" } }, "eus-t2").join(" ");
   dchecks.push(["per-command env wins over default", overrideArgs.includes("DATABASE_URL=postgresql://override") && !overrideArgs.includes("postgresql://default")]);
+
+  // Internet enabled, no sidecar → default bridge (no --network) + fallback DNS.
+  const netDefault = new DockerSandbox(join(tmpdir(), `eus-net-${Date.now()}`), "img")
+    .buildRunArgs("x", {}, "eus-t3")
+    .join(" ");
+  dchecks.push(["default bridge when no sidecar (no --network flag)", !netDefault.includes("--network")]);
+  dchecks.push(["fallback DNS on default bridge", netDefault.includes("--dns 8.8.8.8")]);
+
+  // Internet disabled, no sidecar → fully isolated, no DNS injected.
+  const netNone = new DockerSandbox(join(tmpdir(), `eus-none-${Date.now()}`), "img", { internet: false })
+    .buildRunArgs("x", {}, "eus-t4")
+    .join(" ");
+  dchecks.push(["--network none when internet disabled", netNone.includes("--network none")]);
+  dchecks.push(["no --dns when internet disabled", !netNone.includes("--dns")]);
+
+  // Internet disabled but sidecar present → keep the DB network, no --dns.
+  const netDbOffline = new DockerSandbox(join(tmpdir(), `eus-dboff-${Date.now()}`), "img", {
+    internet: false,
+    network: "eus-net-r9",
+  })
+    .buildRunArgs("x", {}, "eus-t5")
+    .join(" ");
+  dchecks.push(["sidecar network preserved even when internet disabled", netDbOffline.includes("--network eus-net-r9") && !netDbOffline.includes("--network none")]);
+
+  // Custom DNS list is honored.
+  const netCustomDns = new DockerSandbox(join(tmpdir(), `eus-dns-${Date.now()}`), "img", { dns: ["9.9.9.9"] })
+    .buildRunArgs("x", {}, "eus-t6")
+    .join(" ");
+  dchecks.push(["custom DNS honored", netCustomDns.includes("--dns 9.9.9.9") && !netCustomDns.includes("8.8.8.8")]);
+
   for (const [label, pass] of dchecks) {
     console.log(`${pass ? "PASS" : "FAIL"}  ${label}`);
     if (!pass) ok = false;

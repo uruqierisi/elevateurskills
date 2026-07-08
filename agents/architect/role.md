@@ -131,6 +131,20 @@ Include the full `database` and `api` blocks:
 }
 ```
 
+## Infrastructure Compatibility
+
+When designing Docker based applications:
+
+- Keep build and runtime environments compatible.
+- Prisma generated binaries must match the runtime OS. The backend agent
+  configures `schema.prisma` with
+  `binaryTargets = ["native", "linux-musl-openssl-3.0.x"]` and prefers a
+  `node:20-bookworm-slim` runtime image — design the contract so nothing forces
+  a conflicting base image or OpenSSL 1.1 dependency.
+- Choose Docker images intentionally.
+- Avoid unnecessary dependency debugging loops: the stack is Node + Express +
+  Prisma + PostgreSQL by design so the agents never fight the container.
+
 ## Hard design decisions when there IS a database (api-only / fullstack)
 
 - **The database is PostgreSQL. Always.** `stack.database` and

@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { render, Box, Text, useInput, type Instance } from "ink";
 import TextInput from "ink-text-input";
 import type { EventBus, CheckpointDecision } from "../core/events.js";
@@ -10,13 +10,21 @@ import {
   clearCheckpoint,
   enterMain,
   orchestratorStatus,
-  transcriptLines,
+  computeViewport,
+  createLineCache,
+  flattenBlocksCached,
+  scrollReduce,
+  initialScroll,
   type TuiModel,
   type TreeNode,
   type NodeStatus,
-  type StyledLine,
+  type Viewport,
+  type ScrollState,
+  type ScrollAction,
+  type ScrollGeom,
 } from "./model.js";
 import { theme, TAGLINE } from "./theme.js";
+import { MOUSE_ON, MOUSE_OFF, WHEEL_LINES, parseMouseEvents } from "./mouse.js";
 import type { Renderer, CheckpointBudget } from "./plain.js";
 import { estimateCostUsd, formatCostUsd } from "./format.js";
 
@@ -130,34 +138,7 @@ function Splash({ m, frame }: { m: TuiModel; frame: string }): React.ReactElemen
   );
 }
 
-interface Viewport {
-  visible: StyledLine[];
-  viewport: number;
-  start: number; // index of first visible line in the full buffer
-  total: number; // total buffered lines
-  above: number; // lines hidden above the viewport
-  below: number; // lines hidden below the viewport
-}
-
-/**
- * Slice the flat line buffer to the window the viewport shows. `scrollOffset` is
- * measured in lines up from the bottom: 0 pins to the newest line; the maximum
- * offset shows the very top. Returns the padded visible slice plus the counts of
- * hidden lines above/below for the scroll indicator.
- */
-function computeViewport(lines: StyledLine[], height: number, scrollOffset: number): Viewport {
-  const viewport = Math.max(1, height);
-  const total = lines.length;
-  const maxStart = Math.max(0, total - viewport);
-  const start = Math.max(0, Math.min(maxStart, maxStart - scrollOffset));
-  const visible = lines.slice(start, start + viewport);
-  while (visible.length < viewport) visible.push({ text: "" });
-  const above = start;
-  const below = Math.max(0, total - (start + viewport));
-  return { visible, viewport, start, total, above, below };
-}
-
-function Transcript({ vp, width }: { vp: Viewport; width: number }): React.ReactElement {
+function Transcript({ vp, width, following }: { vp: Viewport; width: number; following: boolean }): React.ReactElement {
   const { visible, viewport, start, total, above, below } = vp;
   const maxStart = Math.max(0, total - viewport);
   // Scrollbar thumb position along the viewport track.
@@ -176,9 +157,11 @@ function Transcript({ vp, width }: { vp: Viewport; width: number }): React.React
             );
           }
           if (i === viewport - 1 && below > 0) {
+            // Not following (frozen viewport): advertise the backlog + how to
+            // re-engage follow. `following` is false here whenever below > 0.
             return (
               <Text key={i} color={theme.accent} wrap="truncate-end">
-                ▼ {below} more (PgDn · End to follow)
+                ▼ {below} new lines (End{following ? "" : " to follow"})
               </Text>
             );
           }
@@ -277,7 +260,7 @@ function StatusBar({ m, cols }: { m: TuiModel; cols: number }): React.ReactEleme
       </Text>
     );
   }
-  const text = "PgUp/PgDn scroll · Home/End top/bottom · esc stop · ctrl-q quit";
+  const text = "wheel/PgUp/PgDn scroll · Home/End top/bottom · esc stop · ctrl-q quit";
   return (
     <Text dimColor wrap="truncate-end">
       {clip1(text, cols)}
@@ -290,16 +273,24 @@ function InputArea({
   onChange,
   onSubmit,
   active,
+  width,
 }: {
   value: string;
   onChange: (v: string) => void;
   onSubmit: (v: string) => void;
   active: boolean;
+  width: number;
 }): React.ReactElement {
+  // Full-width bordered row pinned to the bottom. Without an explicit width the
+  // bordered Box shrank to its content ("> "), collapsing into a ~2-char box in
+  // the corner. The prompt marker is fixed-width; the TextInput flexes to fill
+  // the rest and scrolls horizontally for long input.
   return (
-    <Box borderStyle="round" borderColor="green" paddingX={1}>
+    <Box borderStyle="round" borderColor="green" paddingX={1} width={Math.max(4, width)}>
       <Text color="green">{"> "}</Text>
-      <TextInput value={value} onChange={onChange} onSubmit={onSubmit} focus={active} placeholder="" />
+      <Box flexGrow={1}>
+        <TextInput value={value} onChange={onChange} onSubmit={onSubmit} focus={active} placeholder="" />
+      </Box>
     </Box>
   );
 }
@@ -308,12 +299,17 @@ function InputArea({
 
 export function Dashboard({ store }: { store: Store }): React.ReactElement {
   const [tick, setTick] = useState(0);
-  // scrollOffset: lines scrolled up from the bottom. 0 = pinned to newest.
-  const [scrollOffset, setScrollOffset] = useState(0);
+  // Viewport scroll/follow state — all scroll inputs flow through the reducer.
+  const [scroll, setScroll] = useState<ScrollState>(initialScroll);
   const [input, setInput] = useState("");
-  // Previous line-buffer length, to hold position when scrolled up and new
-  // lines arrive (increase the offset by the growth so the view stays put).
+  // Previous line-buffer length, to detect growth (hold position when scrolled
+  // up; stay pinned when following).
   const prevLenRef = useRef(0);
+  // Incremental flatten cache: only new/changed blocks are re-wrapped per event.
+  const lineCacheRef = useRef(createLineCache());
+  // Latest viewport geometry, read by the async mouse handler (which is bound
+  // once and can't close over per-render values).
+  const geomRef = useRef<ScrollGeom>({ total: 0, height: 1 });
 
   // Single render/animation loop: advances the spinner and the splash timer.
   useEffect(() => {
@@ -351,27 +347,57 @@ export function Dashboard({ store }: { store: Store }): React.ReactElement {
   const topHeight = Math.max(1, rows - chrome);
   const leftWidth = Math.max(20, cols - SIDEBAR_WIDTH - 1);
   const contentWidth = Math.max(10, leftWidth - 2);
-  const lines = transcriptLines(m.blocks, contentWidth, theme.accent);
+  // Flatten only when blocks or the wrap width change — not on every spinner
+  // tick — and only re-wrap the blocks that actually changed (see the cache).
+  const lines = useMemo(
+    () => flattenBlocksCached(lineCacheRef.current, m.blocks, contentWidth, theme.accent),
+    [m.blocks, contentWidth],
+  );
   const maxOffset = Math.max(0, lines.length - topHeight);
+  const geom: ScrollGeom = { total: lines.length, height: topHeight };
+  geomRef.current = geom;
+  const dispatchScroll = (action: ScrollAction) => setScroll((s) => scrollReduce(s, action, geomRef.current));
 
-  // Stick-to-bottom: when new lines arrive, hold the viewed content in place if
-  // the user has scrolled up; stay pinned to the bottom when at offset 0.
+  // New lines arrived: follow → stay pinned; scrolled up → hold position.
   useEffect(() => {
     const prev = prevLenRef.current;
     const cur = lines.length;
     prevLenRef.current = cur;
     const grew = cur - prev;
-    if (grew > 0) {
-      setScrollOffset((o) => (o === 0 ? 0 : Math.min(Math.max(0, cur - topHeight), o + grew)));
-    }
+    if (grew > 0) dispatchScroll({ type: "grew", amount: grew });
   }, [lines.length, topHeight]);
 
-  // Keep the offset valid when the viewport grows (resize) or the buffer shrinks.
+  // Re-clamp when the viewport grows (resize) or the buffer re-wraps/shrinks.
   useEffect(() => {
-    setScrollOffset((o) => Math.min(o, maxOffset));
+    dispatchScroll({ type: "clamp" });
   }, [maxOffset]);
 
-  const vp = computeViewport(lines, topHeight, Math.min(scrollOffset, maxOffset));
+  // Mouse wheel: enable xterm mouse reporting on mount, dispatch wheel ticks to
+  // the same reducer, and ALWAYS disable it on unmount (ctrl-q, esc-stop, and
+  // stop() all unmount, running this cleanup). A process-level net in
+  // attachTuiRenderer covers SIGINT/crash where cleanup may not run.
+  useEffect(() => {
+    const stdout = process.stdout;
+    const stdin = process.stdin;
+    if (!stdout.isTTY) return; // no-op under tests / pipes
+    stdout.write(MOUSE_ON);
+    const onData = (buf: Buffer | string): void => {
+      for (const ev of parseMouseEvents(buf.toString())) {
+        dispatchScroll(ev === "wheelUp" ? { type: "up", amount: WHEEL_LINES } : { type: "down", amount: WHEEL_LINES });
+      }
+    };
+    stdin.on("data", onData);
+    return () => {
+      stdin.off("data", onData);
+      try {
+        stdout.write(MOUSE_OFF);
+      } catch {
+        /* stream may be gone during teardown */
+      }
+    };
+  }, []);
+
+  const vp = computeViewport(lines, topHeight, Math.min(scroll.offset, maxOffset));
 
   useInput((inputChar, key) => {
     // Command confirm: single-key y/n, input box disabled.
@@ -415,11 +441,10 @@ export function Dashboard({ store }: { store: Store }): React.ReactElement {
     const seq = inputChar.replace(/^\u001B/, "");
     const isHome = HOME_SEQS.has(seq);
     const isEnd = END_SEQS.has(seq);
-    const page = Math.max(1, topHeight - 1);
-    if (key.pageUp) setScrollOffset((o) => Math.min(maxOffset, o + page));
-    else if (key.pageDown) setScrollOffset((o) => Math.max(0, o - page));
-    else if (isHome) setScrollOffset(maxOffset); // jump to top
-    else if (isEnd) setScrollOffset(0); // jump to bottom + re-pin to follow
+    if (key.pageUp) dispatchScroll({ type: "pageUp" });
+    else if (key.pageDown) dispatchScroll({ type: "pageDown" });
+    else if (isHome) dispatchScroll({ type: "top" }); // jump to top
+    else if (isEnd) dispatchScroll({ type: "bottom" }); // jump to bottom + re-follow
   });
 
   if (m.phase === "splash") return <Splash m={m} frame={frame} />;
@@ -439,7 +464,7 @@ export function Dashboard({ store }: { store: Store }): React.ReactElement {
       ) : null}
       <Box flexDirection="row" height={topHeight} overflow="hidden">
         <Box flexDirection="column" width={leftWidth} height={topHeight} paddingX={1} overflow="hidden">
-          <Transcript vp={vp} width={contentWidth} />
+          <Transcript vp={vp} width={contentWidth} following={scroll.follow} />
         </Box>
         <Box flexDirection="column" width={SIDEBAR_WIDTH} height={topHeight} overflow="hidden">
           <Box flexGrow={1} overflow="hidden">
@@ -461,11 +486,12 @@ export function Dashboard({ store }: { store: Store }): React.ReactElement {
       <Box height={STATUS_HEIGHT} flexShrink={0}>
         <StatusBar m={m} cols={cols} />
       </Box>
-      <Box height={INPUT_HEIGHT} flexShrink={0}>
+      <Box height={INPUT_HEIGHT} flexShrink={0} width={cols}>
         <InputArea
           value={input}
           onChange={setInput}
           active={inputActive}
+          width={cols}
           onSubmit={(v) => {
             const text = v.trim();
             if (text) {
@@ -536,6 +562,19 @@ export function attachTuiRenderer(bus: EventBus, opts: { model?: string; control
     if (instance) instance.unmount();
   };
 
+  // Safety net: the Dashboard effect disables mouse reporting on unmount, but a
+  // SIGINT or hard crash can bypass React cleanup and leave the terminal stuck
+  // in mouse-capture mode. Restore it unconditionally on process teardown too.
+  const restoreMouse = (): void => {
+    try {
+      if (process.stdout.isTTY) process.stdout.write(MOUSE_OFF);
+    } catch {
+      /* stream gone */
+    }
+  };
+  process.once("exit", restoreMouse);
+  process.once("SIGINT", restoreMouse);
+
   return {
     awaitCheckpoint(stage: string, artifactPaths: string[], budget?: CheckpointBudget): Promise<CheckpointDecision> {
       return new Promise((resolve) => {
@@ -559,6 +598,9 @@ export function attachTuiRenderer(bus: EventBus, opts: { model?: string; control
         instance.unmount();
         instance = null;
       }
+      restoreMouse();
+      process.off("exit", restoreMouse);
+      process.off("SIGINT", restoreMouse);
       restoreConsole();
     },
   };

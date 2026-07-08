@@ -22,8 +22,10 @@
     "smoke:llm": "tsx scripts/smoke-llm.ts",
     "smoke:loop": "tsx scripts/smoke-loop.ts",
     "smoke:tui": "tsx scripts/smoke-tui.tsx",
+    "smoke:ui": "tsx scripts/smoke-ui.ts",
     "smoke:sandbox": "tsx scripts/smoke-sandbox.ts",
-    "smoke:limits": "tsx scripts/smoke-limits.ts"
+    "smoke:limits": "tsx scripts/smoke-limits.ts",
+    "test": "npm run typecheck && npm run smoke:ui && npm run smoke:tui && npm run smoke:loop && npm run smoke:limits && npm run smoke:sandbox"
   },
   "engines": {
     "node": ">=20"

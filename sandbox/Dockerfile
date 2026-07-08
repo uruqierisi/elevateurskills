@@ -25,11 +25,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libgbm1 libasound2 libpango-1.0-0 libcairo2 \
   && rm -rf /var/lib/apt/lists/*
 
-# Prisma engine configuration for this container:
-#   - pull engines from the official mirror,
-#   - force the *binary* query engine (not WASM), the more reliable path inside
-#     a Linux container.
-ENV PRISMA_ENGINES_MIRROR=https://binaries.prisma.io
+# Prisma engine configuration for this container.
+#
+# Do NOT pin PRISMA_ENGINES_MIRROR. Prisma's default engine resolution already
+# picks a reachable host (and has fallbacks); pinning a single hostname turns a
+# transient DNS/CDN problem on that one host into a total, unrecoverable failure
+# of every `prisma generate`. We were bitten by exactly this: the previously
+# pinned `binaries.prisma.io` went NXDOMAIN from some networks, so no engine
+# could ever download even though the default S3 host resolved fine.
+#
+# Force the *binary* query engine (not WASM) — the more reliable path in a Linux
+# container.
 ENV PRISMA_CLI_QUERY_ENGINE_TYPE=binary
 
 # Working directory for the generated project (matches the bind mount).
@@ -38,17 +44,24 @@ WORKDIR /workspace
 # Global tooling the agents commonly reach for. Having the Prisma CLI already
 # present means `npx prisma generate` / `npx prisma migrate` don't have to
 # re-download the CLI on every run.
-RUN npm i -g prisma typescript ts-node tsx jest vitest
+#
+# Prisma is pinned to the v6 line on purpose. Prisma 7 is a breaking rewrite:
+# the classic `datasource { url = env("DATABASE_URL") }` schema and the
+# `prisma-client-js` generator this stack (and the backend role's mandated
+# schema) rely on are rejected by v7 (error P1012 — url must move to
+# prisma.config.ts). An unpinned `npm i -g prisma` silently pulls v7 `latest`
+# and breaks every generated backend. v6 is the current classic-schema line.
+RUN npm i -g prisma@6 typescript ts-node tsx jest vitest
 
-# Best-effort: warm the Prisma query/schema engines into the image at BUILD time
-# (running `prisma generate` on a throwaway schema forces the engine download),
-# so a connected machine never re-downloads them at runtime. Non-fatal (`|| true`):
-# on a restricted network the fetch is skipped here and engines download lazily
-# on first use instead — the build never fails on this.
-RUN mkdir -p /tmp/prisma-warm \
- && printf 'datasource db {\n  provider = "postgresql"\n  url = "postgresql://u:p@localhost:5432/d"\n}\ngenerator client {\n  provider = "prisma-client-js"\n}\nmodel Warm {\n  id String @id @default(uuid())\n}\n' > /tmp/prisma-warm/schema.prisma \
- && (cd /tmp/prisma-warm && prisma generate --schema=/tmp/prisma-warm/schema.prisma || true) \
- && rm -rf /tmp/prisma-warm/node_modules
+# NOTE: there is deliberately no build-time "engine warm" step. It never bought
+# anything: a generated project's engines are downloaded into the bind-mounted
+# workspace during `npm install`/`prisma generate`, not into the image, so a warm
+# only ever primed the CLI's own cache — and a genuinely offline run can't
+# `npm install` the project deps in the first place. Now that the engine mirror
+# is unpinned (see above), whenever npm can reach the registry the Prisma engine
+# host is reachable too, so on-demand download at run time is reliable. Warming
+# only added build fragility (dead-host fetch, v6/v7 skew, root-vs-node cache
+# permissions), so it was removed.
 
 # Commands are injected per-exec (`docker run ... sh -lc "<command>"`), so the
 # default command just keeps the image usable interactively.
